@@ -1,32 +1,23 @@
-;;; org-insight.el --- Recursive grouped search with live whole-file preview -*- lexical-binding: t; -*-
+;;; org-insight.el --- Grouped recursive search with live preview (debounced minibuffer) -*- lexical-binding: t; -*-
 ;;
 ;; Author: Your Name <you@example.com>
 ;; Maintainer: Your Name <you@example.com>
-;; Version: 0.8
+;; Version: 1.8
 ;; Package-Requires: ((emacs "27.1"))
 ;; Keywords: tools, search, convenience
 ;; URL: https://example.com/org-insight
 ;;
-;; This file is NOT part of GNU Emacs.
-;;
 ;;; Commentary:
 ;;
-;; org-insight provides a self-contained recursive search UI that:
-;; - Groups matches by file (header shows Org #+TITLE when present; otherwise file name)
-;; - Results buffer navigation:
-;;     n/p : next/previous match
-;;     N/P : next/previous file group
-;;     RET : visit match (optional)
-;;     q   : quit results AND close the preview window (buffer kept)
-;; - Preview shows the WHOLE file (not visiting), highlights the match line and all keyword hits,
-;;   and recenters the match line to the middle of the window.
-;; - Multiple keywords (space/comma-separated), combined with OR or AND.
-;;   If only one keyword is given, the operator is ignored.
-;; - Backends: ripgrep (rg), GNU grep, or pure Emacs Elisp scanning.
-;;
-;; Interactive entry:
-;;   • `org-insight` — free-form prompt. Toggle AND/OR with C-c C-o;
-;;      a short minibuffer message confirms the current operator.
+;; - Grouped results by file (uses Org #+TITLE when present; otherwise filename)
+;; - Results buffer: n/p (matches), N/P (files), RET (visit), q (quit & close preview)
+;; - Whole-file preview (non-visiting) on the right; match line highlighted; keywords colored
+;; - Multiple keywords (space/comma-separated); AND/OR toggle with C-c C-o
+;; - Backends: ripgrep, GNU grep, or pure Elisp
+;; - Live preview while typing in the minibuffer:
+;;   * The preview window/frame is created BEFORE the minibuffer prompt.
+;;   * During typing we only UPDATE the existing preview buffer (no new windows).
+;;   * Updates are **debounced** via `run-with-idle-timer` (default 1.0s idle).
 ;;
 ;;; License: MIT
 ;;
@@ -54,7 +45,7 @@ If nil, you will be prompted for a directory."
 
 (defcustom org-insight-ignore-file-predicate
   (lambda (path)
-    "Return non-nil to skip PATH. Default: skip VCS dirs & common binaries."
+    "Return non-nil to skip PATH. Default ignores VCS dirs and common binaries."
     (let ((case-fold-search t))
       (or (string-match-p "/\\.\\(git\\|hg\\|svn\\)/" path)
           (string-match-p "\\.\\(png\\|jpg\\|jpeg\\|gif\\|bmp\\|pdf\\|zip\\|tar\\|gz\\|7z\\|exe\\|dll\\)$" path))))
@@ -63,18 +54,18 @@ If nil, you will be prompted for a directory."
 
 (defcustom org-insight-backend
   (if (executable-find "rg") 'ripgrep 'emacs)
-  "Backend to use for searching: 'ripgrep, 'grep, or 'emacs."
+  "Backend to use for the final search: 'ripgrep, 'grep, or 'emacs."
   :type '(choice (const :tag "ripgrep (rg)" ripgrep)
                  (const :tag "GNU grep" grep)
                  (const :tag "Built-in (Elisp)" emacs))
   :group 'org-insight)
 
 (defcustom org-insight-ripgrep-extra-args '("--hidden" "--no-heading" "--color=never")
-  "Extra args for ripgrep. `org-insight' always adds --line-number --with-filename."
+  "Extra args for ripgrep. `org-insight' always adds --line-number and --with-filename."
   :type '(repeat string) :group 'org-insight)
 
 (defcustom org-insight-grep-extra-args '("-R" "-n" "-H" "-I")
-  "Extra args for grep. Adds -E for regex or -F for literal automatically."
+  "Extra args for grep. Adds -E for regexp or -F for literal automatically."
   :type '(repeat string) :group 'org-insight)
 
 (defcustom org-insight-default-operator 'or
@@ -86,7 +77,55 @@ If nil, you will be prompted for a directory."
   "Regexp separator for splitting multiple keywords (spaces/commas by default)."
   :type 'string :group 'org-insight)
 
-;; History for free-form keyword prompts
+;; Live preview options ---------------------------------------------------------
+
+(defcustom org-insight-live-preview t
+  "If non-nil, show a live preview during minibuffer input."
+  :type 'boolean :group 'org-insight)
+
+(defcustom org-insight-live-preview-backend 'emacs
+  "Backend used while typing for live preview (recommended: 'emacs)."
+  :type '(choice (const :tag "Built-in (Elisp)" emacs)
+                 (const :tag "ripgrep (rg)" ripgrep)
+                 (const :tag "GNU grep" grep))
+  :group 'org-insight)
+
+(defcustom org-insight-live-preview-debounce 1.0
+  "Seconds of idle time before the live preview updates in the minibuffer.
+Set to a larger value for slower disks or very large trees."
+  :type 'number :group 'org-insight)
+
+(defcustom org-insight-live-preview-min-chars 1
+  "Minimal input length to start live preview."
+  :type 'integer :group 'org-insight)
+
+(defcustom org-insight-live-preview-max-files 10
+  "Max number of file groups to display in the live preview."
+  :type 'integer :group 'org-insight)
+
+(defcustom org-insight-live-preview-max-lines-per-file 3
+  "Max number of matching lines per file to display in the live preview."
+  :type 'integer :group 'org-insight)
+
+(defcustom org-insight-live-preview-close-on-exit t
+  "Close the live preview window/frame when the minibuffer exits."
+  :type 'boolean :group 'org-insight)
+
+(defcustom org-insight-live-preview-side 'bottom
+  "Where to show the live preview side window."
+  :type '(choice (const bottom) (const right)) :group 'org-insight)
+
+(defcustom org-insight-live-preview-display 'side
+  "How to show the live preview: 'side (side window) or 'frame (small frame)."
+  :type '(choice (const side) (const frame))
+  :group 'org-insight)
+
+(defface org-insight-live-header-face
+  '((t :inherit shadow :height 0.95))
+  "Face for the live preview header line."
+  :group 'org-insight)
+
+;; History for keyword prompts
 (defvar org-insight-keyword-history nil
   "Input history for org-insight keyword prompts.")
 
@@ -101,6 +140,17 @@ If nil, you will be prompted for a directory."
 (defvar-local org-insight--preview-keywords nil)   ;; list of strings
 (defvar-local org-insight--preview-regexp-p nil)
 (defvar-local org-insight--last-preview-key nil)
+
+(defvar org-insight--live-buffer-name "*Org Insight Live*")
+(defvar org-insight--live-frame nil)               ;; only when display='frame
+
+;; Minibuffer locals for live update
+(defvar-local org-insight--entry-operator org-insight-default-operator)
+(defvar-local org-insight--live-kick-fn nil)
+(defvar-local org-insight--live-idle-timer nil
+  "Idle timer used to debounce live preview while typing in the minibuffer.")
+(defvar-local org-insight--live-schedule-fn nil
+  "Buffer-local closure used to debounce live preview in the minibuffer.")
 
 ;; -----------------------------------------------------------------------------
 ;; Mode & keymap
@@ -123,7 +173,7 @@ If nil, you will be prompted for a directory."
   (add-hook 'post-command-hook #'org-insight--maybe-preview nil t))
 
 ;; -----------------------------------------------------------------------------
-;; Helpers: keywords, files
+;; Helpers: keywords, files, operator toggle
 ;; -----------------------------------------------------------------------------
 
 (defun org-insight--split-keywords (input)
@@ -140,23 +190,18 @@ If nil, you will be prompted for a directory."
         (push f out)))
     (nreverse out)))
 
-;; -----------------------------------------------------------------------------
-;; Operator toggling (minibuffer-safe)
-;; -----------------------------------------------------------------------------
-
-(defvar org-insight--entry-operator org-insight-default-operator
-  "Operator (AND/OR) used during live minibuffer entry.")
-
 (defun org-insight--operator-label (&optional op)
   (if (eq (or op org-insight--entry-operator) 'and) "AND" "OR"))
 
 (defun org-insight--toggle-operator-during-entry ()
-  "Toggle AND/OR during keyword entry; show a brief confirmation."
+  "Toggle AND/OR during keyword entry; force a debounced live refresh."
   (interactive)
   (setq org-insight--entry-operator
         (if (eq org-insight--entry-operator 'and) 'or 'and))
   (when (minibufferp)
-    (minibuffer-message " Operator: %s" (org-insight--operator-label))))
+    (minibuffer-message " Operator: %s" (org-insight--operator-label))
+    (when (functionp org-insight--live-kick-fn)
+      (funcall org-insight--live-kick-fn))))
 
 ;; -----------------------------------------------------------------------------
 ;; Backends (single keyword helpers + collectors)
@@ -184,11 +229,19 @@ If nil, you will be prompted for a directory."
     (nreverse items)))
 
 (defun org-insight--parse-lno-line (s)
-  "Parse \"FILE:LINE:TEXT\" into (FILE LINE TEXT) or nil."
-  (when (string-match "^\\([^:\n]+\\):\\([0-9]+\\):\\(.*\\)$" s)
+  "Parse \"FILE:LINE:TEXT\" robustly (supports Windows drive letters)."
+  (cond
+   ;; C:\path\to\file:123:the line...
+   ((string-match "^\\([a-zA-Z]:[^:\n]*\\):\\([0-9]+\\):\\(.*\\)$" s)
     (list (match-string 1 s)
           (string-to-number (match-string 2 s))
-          (match-string 3 s))))
+          (match-string 3 s)))
+   ;; /path/to/file:123:the line...
+   ((string-match "^\\([^:\n]+\\):\\([0-9]+\\):\\(.*\\)$" s)
+    (list (match-string 1 s)
+          (string-to-number (match-string 2 s))
+          (match-string 3 s)))
+   (t nil)))
 
 (defun org-insight--call-process-lines (program args dir)
   "Run PROGRAM with ARGS in DIR, return list of output lines."
@@ -202,7 +255,7 @@ If nil, you will be prompted for a directory."
 
 (defun org-insight--collect-lines-ripgrep (dir keyword regexp-p)
   (unless (executable-find "rg")
-    (error "ripgrep (rg) not found; set `org-insight-backend' to 'grep or 'emacs"))
+    (error "ripgrep (rg) not found; set backend to 'grep or 'emacs"))
   (let* ((args (append org-insight-ripgrep-extra-args
                        '("--with-filename" "--line-number")
                        (unless regexp-p '("-F"))
@@ -219,7 +272,7 @@ If nil, you will be prompted for a directory."
 
 (defun org-insight--collect-lines-grep (dir keyword regexp-p)
   (unless (executable-find "grep")
-    (error "grep not found; set `org-insight-backend' to 'ripgrep or 'emacs"))
+    (error "grep not found; set backend to 'ripgrep or 'emacs"))
   (let* ((mode-flag (if regexp-p "-E" "-F"))
          (args (append org-insight-grep-extra-args (list mode-flag "--" keyword ".")))
          (lines (org-insight--call-process-lines "grep" args dir))
@@ -291,7 +344,7 @@ If nil, you will be prompted for a directory."
       (_ (user-error "Unknown operator: %S" operator)))))
 
 ;; -----------------------------------------------------------------------------
-;; Org helpers & rendering
+;; Org helpers & rendering (main results)
 ;; -----------------------------------------------------------------------------
 
 (defun org-insight--org-file-title (file)
@@ -307,6 +360,27 @@ If nil, you will be prompted for a directory."
 (defun org-insight--default-display-name (file)
   (or (org-insight--org-file-title file)
       (file-name-nondirectory file)))
+
+(defun org-insight--group-items-by-file (items display-fn)
+  "Return an alist of plist groups (:file :display :items) from ITEMS."
+  (let ((table (make-hash-table :test 'equal)))
+    (dolist (it items)
+      (let* ((file (org-insight-item-file it))
+             (bucket (gethash file table))
+             (disp (or (car-safe bucket) (funcall display-fn file)))
+             (old  (cdr-safe bucket)))
+        (puthash file (cons disp (append old (list it))) table)))
+    (let (alist)
+      (maphash (lambda (file pair)
+                 (push (list :file file :display (car pair) :items (cdr pair)) alist))
+               table)
+      (sort alist
+            (lambda (a b)
+              (let ((da (plist-get a :display))
+                    (db (plist-get b :display)))
+                (if (string= da db)
+                    (string< (plist-get a :file) (plist-get b :file))
+                  (string< da db))))))))
 
 (defun org-insight--render (file-groups header-text dir regexp-p keywords)
   "Show grouped results. KEYWORDS is a list for preview highlighting."
@@ -354,7 +428,7 @@ If nil, you will be prompted for a directory."
     (pop-to-buffer buf)))
 
 ;; -----------------------------------------------------------------------------
-;; Preview (whole file, recenter match in middle)
+;; Whole-file line preview (for selected entry)
 ;; -----------------------------------------------------------------------------
 
 (defun org-insight--get-props-at-point ()
@@ -408,19 +482,19 @@ If nil, you will be prompted for a directory."
 ;; -----------------------------------------------------------------------------
 
 (defun org-insight-next-result () (interactive)
-  (let* ((start (min (1+ (line-end-position)) (point-max)))
-         (pos (text-property-not-all start (point-max) 'org-insight-line nil)))
-    (if pos (goto-char (progn (goto-char pos) (line-beginning-position)))
-      (message "No more results"))))
+       (let* ((start (min (1+ (line-end-position)) (point-max)))
+              (pos (text-property-not-all start (point-max) 'org-insight-line nil)))
+         (if pos (goto-char (progn (goto-char pos) (line-beginning-position)))
+           (message "No more results"))))
 
 (defun org-insight-previous-result () (interactive)
-  (let ((orig (point)) (found nil))
-    (forward-line -1)
-    (while (and (not found) (> (point) (point-min)))
-      (if (get-text-property (line-beginning-position) 'org-insight-line)
-          (setq found t)
-        (forward-line -1)))
-    (if found (beginning-of-line) (goto-char orig) (message "No previous results"))))
+       (let ((orig (point)) (found nil))
+         (forward-line -1)
+         (while (and (not found) (> (point) (point-min)))
+           (if (get-text-property (line-beginning-position) 'org-insight-line)
+               (setq found t)
+             (forward-line -1)))
+         (if found (beginning-of-line) (goto-char orig) (message "No previous results"))))
 
 (defun org-insight--first-result-after-point ()
   (let* ((start (line-beginning-position))
@@ -447,35 +521,35 @@ If nil, you will be prompted for a directory."
         (or (org-insight--first-result-after-point) (goto-char hdr)))))))
 
 (defun org-insight-next-file () (interactive)
-  (let* ((cur (org-insight--current-group-index))
-         (next (if (null cur) 0 (1+ cur))))
-    (if (>= next (org-insight--group-count))
-        (message "No more file groups")
-      (org-insight--goto-group-index next))))
+       (let* ((cur (org-insight--current-group-index))
+              (next (if (null cur) 0 (1+ cur))))
+         (if (>= next (org-insight--group-count))
+             (message "No more file groups")
+           (org-insight--goto-group-index next))))
 
 (defun org-insight-previous-file () (interactive)
-  (let ((cur (org-insight--current-group-index)))
-    (if (or (null cur) (= cur 0))
-        (message "No previous file group")
-      (org-insight--goto-group-index (1- cur)))))
+       (let ((cur (org-insight--current-group-index)))
+         (if (or (null cur) (= cur 0))
+             (message "No previous file group")
+           (org-insight--goto-group-index (1- cur)))))
 
 ;; -----------------------------------------------------------------------------
 ;; Actions
 ;; -----------------------------------------------------------------------------
 
 (defun org-insight-visit () (interactive)
-  (pcase (org-insight--get-props-at-point)
-    (`(,file ,line)
-     (find-file file)
-     (goto-char (point-min))
-     (forward-line (1- line))
-     (recenter))))
+       (pcase (org-insight--get-props-at-point)
+         (`(,file ,line)
+          (find-file file)
+          (goto-char (point-min))
+          (forward-line (1- line))
+          (recenter))))
 
 (defun org-insight-quit () (interactive)
-  (when-let* ((pb (get-buffer "*Org Insight Preview*"))
-              (pw (get-buffer-window pb t)))
-    (when (window-live-p pw) (ignore-errors (delete-window pw))))
-  (quit-window))
+       (when-let* ((pb (get-buffer "*Org Insight Preview*"))
+                   (pw (get-buffer-window pb t)))
+         (when (window-live-p pw) (ignore-errors (delete-window pw))))
+       (quit-window))
 
 ;; -----------------------------------------------------------------------------
 ;; Core runner
@@ -488,42 +562,97 @@ If nil, you will be prompted for a directory."
                           (org-insight--collect-one backend dir kw regexp-p))
                         keywords))
          (items (org-insight--combine-items lists operator))
-         (table (make-hash-table :test 'equal)))
-    (dolist (it items)
-      (let* ((file (org-insight-item-file it))
-             (bucket (gethash file table))
-             (disp (or (car-safe bucket) (funcall display-fn file)))
-             (old  (cdr-safe bucket)))
-        (puthash file (cons disp (append old (list it))) table)))
-    (let (alist)
-      (maphash (lambda (file pair)
-                 (push (list :file file :display (car pair) :items (cdr pair)) alist))
-               table)
-      (setq alist (sort alist
-                        (lambda (a b)
-                          (let ((da (plist-get a :display))
-                                (db (plist-get b :display)))
-                            (if (string= da db)
-                                (string< (plist-get a :file) (plist-get b :file))
-                              (string< da db))))))
-      (let* ((header-str (if (= (length keywords) 1)
-                             (car keywords)
-                           (mapconcat #'identity
-                                      keywords
-                                      (if (eq operator 'and) " & " " | ")))))
-        (org-insight--render alist header-str dir regexp-p keywords)))))
+         (groups (org-insight--group-items-by-file items display-fn))
+         (header-str (if (= (length keywords) 1)
+                         (car keywords)
+                       (mapconcat #'identity
+                                  keywords
+                                  (if (eq operator 'and) " & " " | ")))))
+    (org-insight--render groups header-str dir regexp-p keywords)))
 
 ;; -----------------------------------------------------------------------------
-;; Interactive entry
+;; Live preview (render buffer only) and setup helpers
+;; -----------------------------------------------------------------------------
+
+(defun org-insight--render-live-buffer (groups header dir)
+  "Update the contents of the live preview buffer ONLY (no window ops)."
+  (let* ((buf (get-buffer-create org-insight--live-buffer-name))
+         (inhibit-read-only t))
+    (with-current-buffer buf
+      (setq buffer-read-only nil)
+      (erase-buffer)
+      (insert (propertize
+               (format "org-insight live: \"%s\" in %s  [%s]\n\n"
+                       (if (and header (not (string-empty-p header))) header "—")
+                       (abbreviate-file-name dir)
+                       (if org-insight-use-regexp "regexp" "literal"))
+               'face 'org-insight-live-header-face))
+      (let ((files 0))
+        (dolist (grp groups)
+          (when (< files org-insight-live-preview-max-files)
+            (setq files (1+ files))
+            (let* ((file (plist-get grp :file))
+                   (display (plist-get grp :display))
+                   (items   (plist-get grp :items))
+                   (take    (cl-subseq items 0 (min (length items)
+                                                    org-insight-live-preview-max-lines-per-file))))
+              (insert (propertize (format "%s  (%d)\n" display (length items))
+                                  'face '(:weight bold)))
+              (dolist (it take)
+                (insert (format "  %s:%d: %s\n"
+                                (abbreviate-file-name file)
+                                (org-insight-item-line it)
+                                (org-insight-item-text it))))
+              (when (< (length take) (length items))
+                (insert (format "  ... and %d more lines\n"
+                                (- (length items) (length take)))))
+              (insert "\n"))))
+        (setq buffer-read-only t)))))
+
+(defun org-insight--ensure-live-visible ()
+  "Ensure the live preview buffer is visible BEFORE minibuffer starts."
+  (let ((buf (get-buffer-create org-insight--live-buffer-name)))
+    (pcase org-insight-live-preview-display
+      ('side
+       (or (get-buffer-window buf t)
+           (display-buffer-in-side-window
+            buf (if (eq org-insight-live-preview-side 'right)
+                    '((side . right) (slot . 1) (window-width . 0.4))
+                  '((side . bottom) (slot . 1) (window-height . 0.33))))))
+      ('frame
+       (unless (and (frame-live-p org-insight--live-frame)
+                    (get-buffer-window buf org-insight--live-frame))
+         (setq org-insight--live-frame
+               (make-frame '((name . "Org Insight Live")
+                             (minibuffer . nil) (width . 100) (height . 18)
+                             (unsplittable . t) (visibility . t)
+                             (auto-raise . nil) (auto-lower . nil))))
+         (with-selected-frame org-insight--live-frame
+           (display-buffer buf))))
+      ;; Initialize with an empty header so users see it's on
+      (org-insight--render-live-buffer nil "—" (abbreviate-file-name default-directory)))))
+
+(defun org-insight--close-live ()
+  "Close the live preview window/frame (if any)."
+  (when-let* ((b (get-buffer org-insight--live-buffer-name))
+              (w (get-buffer-window b t)))
+    (when (window-live-p w) (ignore-errors (delete-window w))))
+  (when (and (frame-live-p org-insight--live-frame)
+             (equal (frame-parameter org-insight--live-frame 'name) "Org Insight Live"))
+    (ignore-errors (delete-frame org-insight--live-frame))
+    (setq org-insight--live-frame nil)))
+
+;; -----------------------------------------------------------------------------
+;; Interactive entry (minibuffer; debounced via buffer-local closure)
 ;; -----------------------------------------------------------------------------
 
 ;;;###autoload
 (defun org-insight (&optional display-fn)
-  "Search recursively for lines containing free-form keyword(s) and show results.
+  "Search recursively with grouped results and whole-file preview.
 
-- Type keywords separated by spaces and/or commas.
-- Toggle AND/OR while typing with `C-c C-o`; a brief message shows the current operator.
-- If only one keyword is entered, AND/OR is ignored.
+- Type keywords separated by spaces/commas.
+- Toggle AND/OR with C-c C-o (message shows current operator).
+- Live preview updates after an idle delay; the preview window is created *before* prompting.
 
 Uses `org-insight-default-directory` if set; otherwise prompts for a directory.
 
@@ -532,23 +661,93 @@ Optional DISPLAY-FN is (lambda FILE -> DISPLAY-NAME)."
   (let* ((dir (or org-insight-default-directory
                   (read-directory-name "Directory: ")))
          (regexp-p org-insight-use-regexp)
-         (org-insight--entry-operator org-insight-default-operator)
+         (disp-fn (or display-fn #'org-insight--default-display-name))
          (local-map (let ((m (make-sparse-keymap)))
                       (set-keymap-parent m minibuffer-local-map)
                       (define-key m (kbd "C-c C-o") #'org-insight--toggle-operator-during-entry)
                       m))
-         (prompt "Keywords: ")
-         (input (minibuffer-with-setup-hook
-                    (lambda () (use-local-map local-map))
-                  (read-from-minibuffer prompt
-                                        nil nil nil 'org-insight-keyword-history)))
-         (keywords (or (org-insight--split-keywords input)
-                       (user-error "No keywords provided")))
-         (operator (if (> (length keywords) 1)
-                       org-insight--entry-operator
-                     org-insight-default-operator))
-         (disp-fn (or display-fn #'org-insight--default-display-name)))
-    (org-insight--run dir keywords operator regexp-p disp-fn)))
+         ;; Pre-create the live preview view (window or frame) in the chosen dir
+         (_pre (when org-insight-live-preview
+                 (let ((default-directory dir))
+                   (org-insight--ensure-live-visible))))
+         (prompt "Keywords: "))
+    (let* ((input (minibuffer-with-setup-hook
+                      (lambda ()
+                        (use-local-map local-map)
+                        (setq-local org-insight--entry-operator org-insight-default-operator)
+                        (when org-insight-live-preview
+                          (let* ((mb (current-buffer)))
+                            ;; Called by the idle timer to compute & render preview NOW.
+                            (cl-labels
+                                ((refresh-now ()
+                                   (when (buffer-live-p mb)
+                                     (with-current-buffer mb
+                                       (let* ((s (buffer-substring-no-properties
+                                                  (minibuffer-prompt-end) (point-max)))
+                                              (trim (string-trim s)))
+                                         (if (< (length trim) org-insight-live-preview-min-chars)
+                                             (org-insight--render-live-buffer nil "—" dir)
+                                           (let* ((kws (org-insight--split-keywords trim)))
+                                             (if (null kws)
+                                                 (org-insight--render-live-buffer nil "—" dir)
+                                               (let* ((op (if (> (length kws) 1)
+                                                              org-insight--entry-operator
+                                                            org-insight-default-operator))
+                                                      (backend org-insight-live-preview-backend)
+                                                      (lists (mapcar (lambda (kw)
+                                                                       (org-insight--collect-one backend dir kw regexp-p))
+                                                                     kws))
+                                                      (items  (org-insight--combine-items lists op))
+                                                      (groups (org-insight--group-items-by-file
+                                                               items (or disp-fn #'org-insight--default-display-name)))
+                                                      (header (if (= (length kws) 1)
+                                                                  (car kws)
+                                                                (mapconcat #'identity
+                                                                           kws
+                                                                           (if (eq op 'and) " & " " | ")))))
+                                                 (org-insight--render-live-buffer groups header dir))))))))))
+                              ;; A closure we can safely add/remove from hooks:
+                              (setq-local org-insight--live-schedule-fn
+                                          (lambda (&rest _)
+                                            (when (timerp org-insight--live-idle-timer)
+                                              (cancel-timer org-insight--live-idle-timer))
+                                            (setq org-insight--live-idle-timer
+                                                  (run-with-idle-timer
+                                                   org-insight-live-preview-debounce
+                                                   nil
+                                                   (lambda ()
+                                                     (when (buffer-live-p mb)
+                                                       (with-current-buffer mb
+                                                         (refresh-now))))))))
+                              ;; Expose manual kick for C-c C-o
+                              (setq-local org-insight--live-kick-fn
+                                          (lambda () (funcall org-insight--live-schedule-fn)))
+                              ;; On any edit, just reschedule the idle timer.
+                              (add-hook 'post-self-insert-hook org-insight--live-schedule-fn nil t)
+                              (add-hook 'post-command-hook      org-insight--live-schedule-fn nil t)
+                              ;; Cleanup on exit: remove hooks and cancel timer.
+                              (let (cleanup)
+                                (setq cleanup
+                                      (lambda ()
+                                        (when org-insight-live-preview-close-on-exit
+                                          (org-insight--close-live))
+                                        (when (timerp org-insight--live-idle-timer)
+                                          (cancel-timer org-insight--live-idle-timer))
+                                        (remove-hook 'post-self-insert-hook org-insight--live-schedule-fn t)
+                                        (remove-hook 'post-command-hook      org-insight--live-schedule-fn t)
+                                        (setq org-insight--live-idle-timer nil
+                                              org-insight--live-schedule-fn nil
+                                              org-insight--live-kick-fn nil)
+                                        (remove-hook 'minibuffer-exit-hook cleanup)))
+                                (add-hook 'minibuffer-exit-hook cleanup))))))
+                    (read-from-minibuffer prompt
+                                          nil nil nil 'org-insight-keyword-history)))
+           (keywords (or (org-insight--split-keywords input)
+                         (user-error "No keywords provided")))
+           (operator (if (> (length keywords) 1)
+                         org-insight--entry-operator
+                       org-insight-default-operator)))
+      (org-insight--run dir keywords operator regexp-p disp-fn))))
 
 (provide 'org-insight)
 ;;; org-insight.el ends here
