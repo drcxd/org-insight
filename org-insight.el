@@ -2,7 +2,7 @@
 ;;
 ;; Author: Your Name <you@example.com>
 ;; Maintainer: Your Name <you@example.com>
-;; Version: 0.1
+;; Version: 0.2
 ;; Package-Requires: ((emacs "27.1"))
 ;; Keywords: tools, search, convenience
 ;; URL: https://example.com/org-insight
@@ -21,12 +21,19 @@
 ;; - Preview shows the WHOLE file in a side window (without visiting the file),
 ;;   highlights the match line, highlights keyword(s) in a distinct face,
 ;;   and recenters the match line to the middle of the window.
-;; - Helper command to search a preconfigured directory and only prompt for the keyword.
+;; - Interactive entry only asks for the KEYWORD; it uses
+;;   `org-insight-default-directory` if set, otherwise prompts for a directory.
+;;
+;; NEW: Choose your backend:
+;;   - Built-in Emacs scanning (pure Elisp, portable)
+;;   - ripgrep (rg)  — fastest (default if available)
+;;   - GNU grep       — widely available
 ;;
 ;; Usage:
-;;   M-x org-insight
 ;;   (setq org-insight-default-directory "~/org")
-;;   M-x org-insight-in-default-directory
+;;   ;; Optionally:
+;;   (setq org-insight-backend 'ripgrep) ;; or 'grep or 'emacs
+;;   M-x org-insight
 ;;
 ;;; License:
 ;; MIT
@@ -49,8 +56,8 @@
   :type 'boolean :group 'org-insight)
 
 (defcustom org-insight-default-directory nil
-  "Default directory for `org-insight-in-default-directory'.
-If nil, the command will signal an error until you set this variable."
+  "Default directory used by `org-insight'.
+If nil, you will be prompted for a directory."
   :type 'directory :group 'org-insight)
 
 (defcustom org-insight-ignore-file-predicate
@@ -61,6 +68,31 @@ If nil, the command will signal an error until you set this variable."
           (string-match-p "\\.\\(png\\|jpg\\|jpeg\\|gif\\|bmp\\|pdf\\|zip\\|tar\\|gz\\|7z\\|exe\\|dll\\)$" path))))
   "Predicate called with absolute PATH; return non-nil to ignore it."
   :type 'function :group 'org-insight)
+
+(defcustom org-insight-backend
+  (cond
+   ((executable-find "rg") 'ripgrep)
+   (t 'emacs))
+  "Backend to use for searching: one of 'ripgrep, 'grep, or 'emacs.
+- 'ripgrep uses the external `rg` tool if available (fastest).
+- 'grep uses external GNU grep.
+- 'emacs scans files line-by-line in Elisp (portable, slower)."
+  :type '(choice (const :tag "ripgrep (rg)" ripgrep)
+                 (const :tag "GNU grep" grep)
+                 (const :tag "Built-in (Elisp)" emacs))
+  :group 'org-insight)
+
+(defcustom org-insight-ripgrep-extra-args '("--hidden" "--no-heading" "--color=never")
+  "Extra command-line args passed to ripgrep.
+`org-insight` always supplies: --line-number --with-filename."
+  :type '(repeat string)
+  :group 'org-insight)
+
+(defcustom org-insight-grep-extra-args '("-R" "-n" "-H" "-I")
+  "Extra command-line args passed to grep.
+When using regex, -E is added; when literal, -F is added."
+  :type '(repeat string)
+  :group 'org-insight)
 
 ;; -----------------------------------------------------------------------------
 ;; Data structures & buffer-locals
@@ -101,7 +133,7 @@ target line without visiting the file. RET visits the match (optional)."
   (add-hook 'post-command-hook #'org-insight--maybe-preview nil t))
 
 ;; -----------------------------------------------------------------------------
-;; Core helpers
+;; Core helpers: file listing and scanning
 ;; -----------------------------------------------------------------------------
 
 (defun org-insight--directory-files-recursively (dir)
@@ -112,25 +144,81 @@ target line without visiting the file. RET visits the match (optional)."
         (push f out)))
     (nreverse out)))
 
-(defun org-insight--collect-lines (file matcher-fn)
-  "Return list of (org-insight-item ...) matches in FILE using MATCHER-FN(line)->bool."
-  (let (acc)
-    (when (file-regular-p file)
-      (let ((tmp (generate-new-buffer " *org-insight-scan*")))
-        (unwind-protect
-            (with-current-buffer tmp
-              (insert-file-contents file)
-              (goto-char (point-min))
-              (let ((ln 1))
-                (while (not (eobp))
-                  (let ((text (buffer-substring-no-properties
-                               (line-beginning-position) (line-end-position))))
-                    (when (funcall matcher-fn text)
-                      (push (make-org-insight-item :file file :line ln :text text) acc)))
-                  (forward-line 1)
-                  (setq ln (1+ ln)))))
-          (kill-buffer tmp))))
-    (nreverse acc)))
+(defun org-insight--collect-lines-elisp (files matcher-fn)
+  "Collect matches across FILES using MATCHER-FN(line) → bool (pure Elisp).
+Returns a list of `org-insight-item'."
+  (let (items)
+    (dolist (file files)
+      (when (file-regular-p file)
+        (let ((tmp (generate-new-buffer " *org-insight-scan*")))
+          (unwind-protect
+              (with-current-buffer tmp
+                (insert-file-contents file)
+                (goto-char (point-min))
+                (let ((ln 1))
+                  (while (not (eobp))
+                    (let ((text (buffer-substring-no-properties
+                                 (line-beginning-position) (line-end-position))))
+                      (when (funcall matcher-fn text)
+                        (push (make-org-insight-item :file file :line ln :text text) items)))
+                    (forward-line 1)
+                    (setq ln (1+ ln)))))
+            (kill-buffer tmp)))))
+    (nreverse items)))
+
+(defun org-insight--parse-lno-line (s)
+  "Parse a grep/rg line \"FILE:LINE:TEXT\" into (FILE LINE TEXT) or nil."
+  (when (string-match "^\\([^:\n]+\\):\\([0-9]+\\):\\(.*\\)$" s)
+    (list (match-string 1 s)
+          (string-to-number (match-string 2 s))
+          (match-string 3 s))))
+
+(defun org-insight--call-process-lines (program args dir)
+  "Run PROGRAM with ARGS in DIR, return list of output lines (strings)."
+  (let ((default-directory (file-name-as-directory (expand-file-name dir))))
+    (with-temp-buffer
+      (let ((status (apply #'process-file program nil (current-buffer) nil args)))
+        (cond
+         ((or (eq status 0) (eq status 1)) ; 1 means no matches for grep/rg
+          (split-string (buffer-string) "\n" t))
+         (t
+          (error "%s failed with exit code %s and output:\n%s"
+                 program status (buffer-string))))))))
+
+(defun org-insight--collect-lines-ripgrep (dir keyword regexp-p)
+  "Collect matches using ripgrep in DIR for KEYWORD. Returns list of items."
+  (unless (executable-find "rg")
+    (error "ripgrep (rg) not found in PATH; set `org-insight-backend' to 'grep or 'emacs"))
+  (let* ((args (append org-insight-ripgrep-extra-args
+                       '("--with-filename" "--line-number")
+                       (if regexp-p '() '("-F"))
+                       (list "--" keyword "."))) ; search from dir root
+         (lines (org-insight--call-process-lines "rg" args dir))
+         items)
+    (dolist (ln lines)
+      (pcase (org-insight--parse-lno-line ln)
+        (`(,file ,lno ,text)
+         (let ((abs (expand-file-name file dir)))
+           (unless (funcall org-insight-ignore-file-predicate abs)
+             (push (make-org-insight-item :file abs :line lno :text text) items))))))
+    (nreverse items)))
+
+(defun org-insight--collect-lines-grep (dir keyword regexp-p)
+  "Collect matches using GNU grep in DIR for KEYWORD. Returns list of items."
+  (unless (executable-find "grep")
+    (error "grep not found in PATH; set `org-insight-backend' to 'ripgrep or 'emacs"))
+  (let* ((mode-flag (if regexp-p "-E" "-F"))
+         (args (append org-insight-grep-extra-args
+                       (list mode-flag "--" keyword ".")))
+         (lines (org-insight--call-process-lines "grep" args dir))
+         items)
+    (dolist (ln lines)
+      (pcase (org-insight--parse-lno-line ln)
+        (`(,file ,lno ,text)
+         (let ((abs (expand-file-name file dir)))
+           (unless (funcall org-insight-ignore-file-predicate abs)
+             (push (make-org-insight-item :file abs :line lno :text text) items))))))
+    (nreverse items)))
 
 (defun org-insight--org-file-title (file)
   "Return #+TITLE from Org FILE (case-insensitive), or nil if absent.
@@ -359,57 +447,59 @@ Keeps the preview buffer around; only removes its window."
   (quit-window))
 
 ;; -----------------------------------------------------------------------------
-;; Entry points
+;; Entry point
 ;; -----------------------------------------------------------------------------
 
 ;;;###autoload
-(defun org-insight (dir keyword &optional display-fn)
-  "Search DIR recursively for lines containing KEYWORD and show grouped results.
+(defun org-insight (keyword &optional display-fn)
+  "Search recursively for lines containing KEYWORD and show grouped results.
+
+Uses `org-insight-default-directory' if set; otherwise prompts for a directory.
+
 KEYWORD is treated as a regexp when `org-insight-use-regexp' is non-nil,
 otherwise matched literally.
 
-DISPLAY-FN is (lambda FILE -> DISPLAY-NAME). If nil, defaults to
-`org-insight--default-display-name'."
-  (interactive "DDirectory: \nsKeyword: ")
-  (let* ((regexp-p org-insight-use-regexp)
-         (match-fn (if regexp-p
-                       (lambda (line) (ignore-errors (string-match-p keyword line)))
-                     (let ((needle (regexp-quote keyword)))
-                       (lambda (line) (string-match-p needle line)))))
-         (disp-fn (or display-fn #'org-insight--default-display-name))
-         (files (org-insight--directory-files-recursively (expand-file-name dir)))
-         ;; Build table keyed by FILE → (DISPLAY . ITEMS)
-         (table (make-hash-table :test 'equal)))
-    (dolist (f files)
-      (let ((items (org-insight--collect-lines f match-fn)))
-        (when items
-          (let* ((bucket (gethash f table))
-                 (disp (or (car-safe bucket) (funcall disp-fn f)))
-                 (old  (cdr-safe bucket)))
-            (puthash f (cons disp (append old items)) table)))))
-    ;; Convert to plist list
-    (let (alist)
-      (maphash (lambda (file pair)
-                 (push (list :file file :display (car pair) :items (cdr pair)) alist))
-               table)
-      ;; Sort by display name then file path for stability
-      (setq alist (sort alist
-                        (lambda (a b)
-                          (let ((da (plist-get a :display))
-                                (db (plist-get b :display)))
-                            (if (string= da db)
-                                (string< (plist-get a :file) (plist-get b :file))
-                              (string< da db))))))
-      (org-insight--render alist keyword dir regexp-p))))
-
-;;;###autoload
-(defun org-insight-in-default-directory (keyword)
-  "Search `org-insight-default-directory' recursively for KEYWORD.
-Prompts only for the keyword; the directory is taken from `org-insight-default-directory'."
+Optional argument DISPLAY-FN is a function (lambda FILE -> DISPLAY-NAME).
+If nil, defaults to `org-insight--default-display-name'."
   (interactive "sKeyword: ")
-  (unless org-insight-default-directory
-    (user-error "Please set `org-insight-default-directory' first"))
-  (org-insight org-insight-default-directory keyword))
+  (let* ((dir (or org-insight-default-directory
+                  (read-directory-name "Directory: ")))
+         (regexp-p org-insight-use-regexp)
+         (disp-fn (or display-fn #'org-insight--default-display-name))
+         items)
+    ;; Gather matches using the selected backend.
+    (setq items
+          (pcase org-insight-backend
+            ('ripgrep (org-insight--collect-lines-ripgrep dir keyword regexp-p))
+            ('grep    (org-insight--collect-lines-grep    dir keyword regexp-p))
+            ('emacs   (let* ((files (org-insight--directory-files-recursively (expand-file-name dir)))
+                             (match-fn (if regexp-p
+                                           (lambda (line) (ignore-errors (string-match-p keyword line)))
+                                         (let ((needle (regexp-quote keyword)))
+                                           (lambda (line) (string-match-p needle line))))))
+                        (org-insight--collect-lines-elisp files match-fn)))
+            (_ (user-error "Unknown `org-insight-backend': %S" org-insight-backend))))
+    ;; Build table keyed by FILE → (DISPLAY . ITEMS)
+    (let ((table (make-hash-table :test 'equal)))
+      (dolist (it items)
+        (let* ((file (org-insight-item-file it))
+               (bucket (gethash file table))
+               (disp (or (car-safe bucket) (funcall disp-fn file)))
+               (old  (cdr-safe bucket)))
+          (puthash file (cons disp (append old (list it))) table)))
+      ;; Convert to plist list and sort
+      (let (alist)
+        (maphash (lambda (file pair)
+                   (push (list :file file :display (car pair) :items (cdr pair)) alist))
+                 table)
+        (setq alist (sort alist
+                          (lambda (a b)
+                            (let ((da (plist-get a :display))
+                                  (db (plist-get b :display)))
+                              (if (string= da db)
+                                  (string< (plist-get a :file) (plist-get b :file))
+                                (string< da db))))))
+        (org-insight--render alist keyword dir regexp-p)))))
 
 (provide 'org-insight)
 ;;; org-insight.el ends here
