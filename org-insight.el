@@ -170,7 +170,8 @@ Set to a larger value for slower disks or very large trees."
   "Results for org-insight. n/p: matches, N/P: files. RET: visit. q: quit & close preview."
   (setq buffer-read-only t)
   (hl-line-mode 1)
-  (add-hook 'post-command-hook #'org-insight--maybe-preview nil t))
+  (add-hook 'post-command-hook #'org-insight--maybe-preview nil t)
+  (add-hook 'kill-buffer-hook #'org-insight--close-preview nil t))
 
 ;; -----------------------------------------------------------------------------
 ;; Helpers: keywords, files, operator toggle
@@ -546,9 +547,8 @@ Set to a larger value for slower disks or very large trees."
           (recenter))))
 
 (defun org-insight-quit () (interactive)
-       (when-let* ((pb (get-buffer "*Org Insight Preview*"))
-                   (pw (get-buffer-window pb t)))
-         (when (window-live-p pw) (ignore-errors (delete-window pw))))
+       (org-insight--close-preview)
+       (org-insight--close-live)
        (quit-window))
 
 ;; -----------------------------------------------------------------------------
@@ -642,6 +642,13 @@ Set to a larger value for slower disks or very large trees."
     (ignore-errors (delete-frame org-insight--live-frame))
     (setq org-insight--live-frame nil)))
 
+(defun org-insight--close-preview ()
+  "Close the results preview side window (\"*Org Insight Preview*\") if visible."
+  (when-let* ((buf (get-buffer "*Org Insight Preview*"))
+              (win (get-buffer-window buf t)))
+    (when (window-live-p win)
+      (ignore-errors (delete-window win)))))
+
 ;; -----------------------------------------------------------------------------
 ;; Interactive entry (minibuffer; debounced via buffer-local closure)
 ;; -----------------------------------------------------------------------------
@@ -671,77 +678,78 @@ Optional DISPLAY-FN is (lambda FILE -> DISPLAY-NAME)."
                  (let ((default-directory dir))
                    (org-insight--ensure-live-visible))))
          (prompt "Keywords: "))
-    (let* ((input (minibuffer-with-setup-hook
-                      (lambda ()
-                        (use-local-map local-map)
-                        (setq-local org-insight--entry-operator org-insight-default-operator)
-                        (when org-insight-live-preview
-                          (let* ((mb (current-buffer)))
-                            ;; Called by the idle timer to compute & render preview NOW.
-                            (cl-labels
-                                ((refresh-now ()
-                                   (when (buffer-live-p mb)
-                                     (with-current-buffer mb
-                                       (let* ((s (buffer-substring-no-properties
-                                                  (minibuffer-prompt-end) (point-max)))
-                                              (trim (string-trim s)))
-                                         (if (< (length trim) org-insight-live-preview-min-chars)
-                                             (org-insight--render-live-buffer nil "—" dir)
-                                           (let* ((kws (org-insight--split-keywords trim)))
-                                             (if (null kws)
-                                                 (org-insight--render-live-buffer nil "—" dir)
-                                               (let* ((op (if (> (length kws) 1)
-                                                              org-insight--entry-operator
-                                                            org-insight-default-operator))
-                                                      (backend org-insight-live-preview-backend)
-                                                      (lists (mapcar (lambda (kw)
-                                                                       (org-insight--collect-one backend dir kw regexp-p))
-                                                                     kws))
-                                                      (items  (org-insight--combine-items lists op))
-                                                      (groups (org-insight--group-items-by-file
-                                                               items (or disp-fn #'org-insight--default-display-name)))
-                                                      (header (if (= (length kws) 1)
-                                                                  (car kws)
-                                                                (mapconcat #'identity
-                                                                           kws
-                                                                           (if (eq op 'and) " & " " | ")))))
-                                                 (org-insight--render-live-buffer groups header dir))))))))))
-                              ;; A closure we can safely add/remove from hooks:
-                              (setq-local org-insight--live-schedule-fn
-                                          (lambda (&rest _)
-                                            (when (timerp org-insight--live-idle-timer)
-                                              (cancel-timer org-insight--live-idle-timer))
-                                            (setq org-insight--live-idle-timer
-                                                  (run-with-idle-timer
-                                                   org-insight-live-preview-debounce
-                                                   nil
-                                                   (lambda ()
-                                                     (when (buffer-live-p mb)
-                                                       (with-current-buffer mb
-                                                         (refresh-now))))))))
-                              ;; Expose manual kick for C-c C-o
-                              (setq-local org-insight--live-kick-fn
-                                          (lambda () (funcall org-insight--live-schedule-fn)))
-                              ;; On any edit, just reschedule the idle timer.
-                              (add-hook 'post-self-insert-hook org-insight--live-schedule-fn nil t)
-                              (add-hook 'post-command-hook      org-insight--live-schedule-fn nil t)
-                              ;; Cleanup on exit: remove hooks and cancel timer.
-                              (let (cleanup)
-                                (setq cleanup
+    (let* ((input (unwind-protect (minibuffer-with-setup-hook
                                       (lambda ()
-                                        (when org-insight-live-preview-close-on-exit
-                                          (org-insight--close-live))
-                                        (when (timerp org-insight--live-idle-timer)
-                                          (cancel-timer org-insight--live-idle-timer))
-                                        (remove-hook 'post-self-insert-hook org-insight--live-schedule-fn t)
-                                        (remove-hook 'post-command-hook      org-insight--live-schedule-fn t)
-                                        (setq org-insight--live-idle-timer nil
-                                              org-insight--live-schedule-fn nil
-                                              org-insight--live-kick-fn nil)
-                                        (remove-hook 'minibuffer-exit-hook cleanup)))
-                                (add-hook 'minibuffer-exit-hook cleanup))))))
-                    (read-from-minibuffer prompt
-                                          nil nil nil 'org-insight-keyword-history)))
+                                        (use-local-map local-map)
+                                        (setq-local org-insight--entry-operator org-insight-default-operator)
+                                        (when org-insight-live-preview
+                                          (let* ((mb (current-buffer)))
+                                            ;; Called by the idle timer to compute & render preview NOW.
+                                            (cl-labels
+                                                ((refresh-now ()
+                                                   (when (buffer-live-p mb)
+                                                     (with-current-buffer mb
+                                                       (let* ((s (buffer-substring-no-properties
+                                                                  (minibuffer-prompt-end) (point-max)))
+                                                              (trim (string-trim s)))
+                                                         (if (< (length trim) org-insight-live-preview-min-chars)
+                                                             (org-insight--render-live-buffer nil "—" dir)
+                                                           (let* ((kws (org-insight--split-keywords trim)))
+                                                             (if (null kws)
+                                                                 (org-insight--render-live-buffer nil "—" dir)
+                                                               (let* ((op (if (> (length kws) 1)
+                                                                              org-insight--entry-operator
+                                                                            org-insight-default-operator))
+                                                                      (backend org-insight-live-preview-backend)
+                                                                      (lists (mapcar (lambda (kw)
+                                                                                       (org-insight--collect-one backend dir kw regexp-p))
+                                                                                     kws))
+                                                                      (items  (org-insight--combine-items lists op))
+                                                                      (groups (org-insight--group-items-by-file
+                                                                               items (or disp-fn #'org-insight--default-display-name)))
+                                                                      (header (if (= (length kws) 1)
+                                                                                  (car kws)
+                                                                                (mapconcat #'identity
+                                                                                           kws
+                                                                                           (if (eq op 'and) " & " " | ")))))
+                                                                 (org-insight--render-live-buffer groups header dir))))))))))
+                                              ;; A closure we can safely add/remove from hooks:
+                                              (setq-local org-insight--live-schedule-fn
+                                                          (lambda (&rest _)
+                                                            (when (timerp org-insight--live-idle-timer)
+                                                              (cancel-timer org-insight--live-idle-timer))
+                                                            (setq org-insight--live-idle-timer
+                                                                  (run-with-idle-timer
+                                                                   org-insight-live-preview-debounce
+                                                                   nil
+                                                                   (lambda ()
+                                                                     (when (buffer-live-p mb)
+                                                                       (with-current-buffer mb
+                                                                         (refresh-now))))))))
+                                              ;; Expose manual kick for C-c C-o
+                                              (setq-local org-insight--live-kick-fn
+                                                          (lambda () (funcall org-insight--live-schedule-fn)))
+                                              ;; On any edit, just reschedule the idle timer.
+                                              (add-hook 'post-self-insert-hook org-insight--live-schedule-fn nil t)
+                                              (add-hook 'post-command-hook      org-insight--live-schedule-fn nil t)
+                                              ;; Cleanup on exit: remove hooks and cancel timer.
+                                              (let (cleanup)
+                                                (setq cleanup
+                                                      (lambda ()
+                                                        (when org-insight-live-preview-close-on-exit
+                                                          (org-insight--close-live))
+                                                        (when (timerp org-insight--live-idle-timer)
+                                                          (cancel-timer org-insight--live-idle-timer))
+                                                        (remove-hook 'post-self-insert-hook org-insight--live-schedule-fn t)
+                                                        (remove-hook 'post-command-hook      org-insight--live-schedule-fn t)
+                                                        (setq org-insight--live-idle-timer nil
+                                                              org-insight--live-schedule-fn nil
+                                                              org-insight--live-kick-fn nil)
+                                                        (remove-hook 'minibuffer-exit-hook cleanup)))
+                                                (add-hook 'minibuffer-exit-hook cleanup))))))
+                                    (read-from-minibuffer prompt
+                                                          nil nil nil 'org-insight-keyword-history))
+                    (org-insight--close-live)))
            (keywords (or (org-insight--split-keywords input)
                          (user-error "No keywords provided")))
            (operator (if (> (length keywords) 1)
