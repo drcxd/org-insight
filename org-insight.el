@@ -116,8 +116,14 @@ Set to a larger value for slower disks or very large trees."
   :type '(choice (const bottom) (const right)) :group 'org-insight)
 
 (defcustom org-insight-live-preview-display 'side
-  "How to show the live preview: 'side (side window) or 'frame (small frame)."
-  :type '(choice (const side) (const frame))
+  "How to show the live preview:
+- 'side     : show in a side window (right/bottom, depending on `org-insight-live-preview-side`)
+- 'replace  : replace the current window (restore it on minibuffer exit)
+- 'frame    : show in a small separate frame."
+  :type '(choice
+          (const :tag "Side window" side)
+          (const :tag "Replace current window" replace)
+          (const :tag "Own frame" frame))
   :group 'org-insight)
 
 (defface org-insight-live-header-face
@@ -143,6 +149,12 @@ Set to a larger value for slower disks or very large trees."
 
 (defvar org-insight--live-buffer-name "*Org Insight Live*")
 (defvar org-insight--live-frame nil)               ;; only when display='frame
+(defvar org-insight--live-replaced-window nil
+  "Window that was replaced by the live preview in 'replace mode.")
+(defvar org-insight--live-replaced-buffer nil
+  "Buffer previously shown in the replaced window.")
+(defvar org-insight--live-replaced-point nil
+  "Point in the previously shown buffer when it was replaced.")
 
 ;; Minibuffer locals for live update
 (defvar-local org-insight--entry-operator org-insight-default-operator)
@@ -629,18 +641,67 @@ Set to a larger value for slower disks or very large trees."
                              (auto-raise . nil) (auto-lower . nil))))
          (with-selected-frame org-insight--live-frame
            (display-buffer buf))))
+      ('replace
+       ;; Remember exactly what we're replacing so we can restore on exit.
+       (unless (and (window-live-p org-insight--live-replaced-window)
+                    (buffer-live-p org-insight--live-replaced-buffer))
+         (setq org-insight--live-replaced-window (selected-window)
+               org-insight--live-replaced-buffer (window-buffer (selected-window))
+               org-insight--live-replaced-point  (window-point  (selected-window))))
+       ;; Show the live preview buffer in the same window (make it “large”).
+       (let ((win (or org-insight--live-replaced-window (selected-window))))
+         (set-window-buffer win buf)
+         (select-window win)))
       ;; Initialize with an empty header so users see it's on
       (org-insight--render-live-buffer nil "—" (abbreviate-file-name default-directory)))))
 
 (defun org-insight--close-live ()
-  "Close the live preview window/frame (if any)."
-  (when-let* ((b (get-buffer org-insight--live-buffer-name))
-              (w (get-buffer-window b t)))
-    (when (window-live-p w) (ignore-errors (delete-window w))))
-  (when (and (frame-live-p org-insight--live-frame)
-             (equal (frame-parameter org-insight--live-frame 'name) "Org Insight Live"))
-    (ignore-errors (delete-frame org-insight--live-frame))
-    (setq org-insight--live-frame nil)))
+  "Close the live preview window/frame (if any), cancel timer, and
+restore windows when 'replace was used."
+  ;; 1) Cancel debounce timer if present
+  (when (and (boundp 'org-insight--live-idle-timer)
+             (timerp org-insight--live-idle-timer))
+    (cancel-timer org-insight--live-idle-timer))
+  (setq org-insight--live-idle-timer nil)
+
+  ;; 2) Close depending on display mode
+  (pcase org-insight-live-preview-display
+    ('replace
+     (let* ((live-buf (or (and (boundp 'org-insight--live-buffer-name)
+                               (get-buffer org-insight--live-buffer-name))
+                          (get-buffer "*Org Insight Live*"))))
+       ;; If we still own the window we replaced, restore its original buffer & point.
+       (when (and (window-live-p org-insight--live-replaced-window)
+                  (buffer-live-p org-insight--live-replaced-buffer))
+         (with-selected-window org-insight--live-replaced-window
+           (when (buffer-live-p org-insight--live-replaced-buffer)
+             (set-window-buffer nil org-insight--live-replaced-buffer))
+           (when (and org-insight--live-replaced-point
+                      (buffer-live-p org-insight--live-replaced-buffer))
+             (set-window-point nil org-insight--live-replaced-point))))
+       ;; Fallback: if the live buffer is visible anywhere, bury it or replace it.
+       (when (buffer-live-p live-buf)
+         (dolist (w (get-buffer-window-list live-buf t t))
+           (when (window-live-p w)
+             (if (buffer-live-p org-insight--live-replaced-buffer)
+                 (set-window-buffer w org-insight--live-replaced-buffer)
+               (quit-window nil w))))
+         (bury-buffer live-buf)))
+     ;; Clear state for the next session.
+     (setq org-insight--live-replaced-window nil
+           org-insight--live-replaced-buffer nil
+           org-insight--live-replaced-point  nil))
+    ('side
+     (when-let* ((b (get-buffer org-insight--live-buffer-name))
+                 (w (get-buffer-window b t)))
+       (when (window-live-p w)
+         (ignore-errors (delete-window w)))))
+    ('frame
+     (when (and (frame-live-p org-insight--live-frame)
+                (equal (frame-parameter org-insight--live-frame 'name) "Org Insight Live"))
+       (ignore-errors (delete-frame org-insight--live-frame)))
+     (setq org-insight--live-frame nil))
+    (_ nil)))
 
 (defun org-insight--close-preview ()
   "Close the results preview side window (\"*Org Insight Preview*\") if visible."
