@@ -164,6 +164,14 @@ Set to a larger value for slower disks or very large trees."
 (defvar-local org-insight--live-schedule-fn nil
   "Buffer-local closure used to debounce live preview in the minibuffer.")
 
+;; Async search state ----------------------------------------------------------
+(defvar org-insight--async-thread nil
+  "Background thread performing the current search.")
+(defvar org-insight--async-input nil
+  "Input string currently being searched asynchronously.")
+(defvar org-insight--async-items nil
+  "Cached items produced by the async search.")
+
 ;; -----------------------------------------------------------------------------
 ;; Mode & keymap
 ;; -----------------------------------------------------------------------------
@@ -608,9 +616,11 @@ Honors `case-fold-search' for case-insensitive search."
           (setq out (nconc out bucket))))
       out)))
 
-(defun org-insight--items-for-input (dir input)
-  "Return list of `org-insight-item' for DIR and minibuffer INPUT,
-stable-sorted by (FILE order of first occurrence, then LINE asc)."
+
+;; Synchronous collector used by the async wrapper
+(defun org-insight--items-for-input-sync (dir input)
+  "Collect `org-insight-item' for DIR and INPUT synchronously.
+Return items stable-sorted by first file occurrence and line number."
   (let* ((kws (org-insight--split-keywords-quoted input))
          (backend (or (and (boundp 'org-insight-backend) org-insight-backend) 'ripgrep))
          (regexp-p (and (boundp 'org-insight-regexp-p) org-insight-regexp-p))
@@ -633,6 +643,32 @@ stable-sorted by (FILE order of first occurrence, then LINE asc)."
             (push it acc)))))
     ;; Stable order: by first-seen file, then line asc
     (org-insight--sort-items-by-file-and-line (nreverse acc))))
+
+(defun org-insight--items-for-input (dir input)
+  "Return list of `org-insight-item' for DIR and INPUT asynchronously.
+Search runs in a background thread to keep minibuffer responsive."
+  (let ((trimmed (string-trim input)))
+    (unless (string-equal trimmed org-insight--async-input)
+      (when (thread-live-p org-insight--async-thread)
+        (thread-signal org-insight--async-thread 'quit nil))
+      (setq org-insight--async-input trimmed
+            org-insight--async-items nil
+            org-insight--async-thread
+            (make-thread
+             (lambda ()
+               (let ((items (org-insight--items-for-input-sync dir trimmed)))
+                 (setq org-insight--async-items items)
+                 (run-at-time
+                  0 nil
+                  (lambda ()
+                    (when (active-minibuffer-window)
+                      (with-selected-window (active-minibuffer-window)
+                        (when (fboundp 'vertico--exhibit)
+                          (vertico--exhibit))))))))))
+    (if (and (string-equal trimmed org-insight--async-input)
+             (not (thread-live-p org-insight--async-thread)))
+        org-insight--async-items
+      nil)))
 
 ;; --- Candidate formatting
 (defun org-insight--format-candidate (it input)
