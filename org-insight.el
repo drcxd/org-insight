@@ -95,9 +95,13 @@ If nil, you will be prompted for a directory."
 Set to a larger value for slower disks or very large trees."
   :type 'number :group 'org-insight)
 
-(defcustom org-insight-live-preview-min-chars 1
-  "Minimal input length to start live preview."
+(defcustom org-insight-min-input-chars 2
+  "Minimal input length before any search or live preview occurs.
+Increasing this helps keep minibuffer typing responsive."
   :type 'integer :group 'org-insight)
+
+(define-obsolete-variable-alias
+  'org-insight-live-preview-min-chars 'org-insight-min-input-chars "0.2")
 
 (defcustom org-insight-live-preview-max-files 10
   "Max number of file groups to display in the live preview."
@@ -610,29 +614,36 @@ Honors `case-fold-search' for case-insensitive search."
 
 (defun org-insight--items-for-input (dir input)
   "Return list of `org-insight-item' for DIR and minibuffer INPUT,
-stable-sorted by (FILE order of first occurrence, then LINE asc)."
-  (let* ((kws (org-insight--split-keywords-quoted input))
-         (backend (or (and (boundp 'org-insight-backend) org-insight-backend) 'ripgrep))
-         (regexp-p (and (boundp 'org-insight-regexp-p) org-insight-regexp-p))
-         (collector
-          (pcase backend
-            ('ripgrep #'org-insight--collect-lines-ripgrep)
-            ('grep    #'org-insight--collect-lines-grep)
-            (_       #'org-insight--collect-lines-elisp)))
-         (seen (make-hash-table :test 'equal))
-         acc)
-    (setq org-insight--current-keywords kws)
-    ;; Gather and dedupe by (file . line)
-    (dolist (kw kws)
-      (dolist (it (funcall collector dir kw regexp-p))
-        (let* ((file (org-insight-item-file it))
-               (line (org-insight-item-line it))
-               (key  (cons file line)))
-          (unless (gethash key seen)
-            (puthash key t seen)
-            (push it acc)))))
-    ;; Stable order: by first-seen file, then line asc
-    (org-insight--sort-items-by-file-and-line (nreverse acc))))
+stable-sorted by (FILE order of first occurrence, then LINE asc).
+No search is performed when INPUT is shorter than
+`org-insight-min-input-chars'."
+  (let* ((trimmed (string-trim input)))
+    (if (< (length trimmed) org-insight-min-input-chars)
+        (progn
+          (setq org-insight--current-keywords nil)
+          nil)
+      (let* ((kws (org-insight--split-keywords-quoted trimmed))
+             (backend (or (and (boundp 'org-insight-backend) org-insight-backend) 'ripgrep))
+             (regexp-p (and (boundp 'org-insight-regexp-p) org-insight-regexp-p))
+             (collector
+              (pcase backend
+                ('ripgrep #'org-insight--collect-lines-ripgrep)
+                ('grep    #'org-insight--collect-lines-grep)
+                (_       #'org-insight--collect-lines-elisp)))
+             (seen (make-hash-table :test 'equal))
+             acc)
+        (setq org-insight--current-keywords kws)
+        ;; Gather and dedupe by (file . line)
+        (dolist (kw kws)
+          (dolist (it (funcall collector dir kw regexp-p))
+            (let* ((file (org-insight-item-file it))
+                   (line (org-insight-item-line it))
+                   (key  (cons file line)))
+              (unless (gethash key seen)
+                (puthash key t seen)
+                (push it acc)))))
+        ;; Stable order: by first-seen file, then line asc
+        (org-insight--sort-items-by-file-and-line (nreverse acc))))))
 
 ;; --- Candidate formatting
 (defun org-insight--format-candidate (it input)
@@ -696,30 +707,31 @@ Additional PROPS are added as text properties."
   "A completion table that searches DIR from minibuffer input.
 Populates `org-insight--cand-map` keyed by the REAL candidate string."
   (let ((gen (lambda (input)
-               (when (hash-table-p org-insight--cand-map)
-                 (clrhash org-insight--cand-map))
-               (mapcar
-                (lambda (it)
-                  (let* ((file (org-insight-item-file it))
-                         (line (org-insight-item-line it))
-                         (txt  (org-insight-item-text it))
-                         ;; display as \"LINE: text\" (no filename), with a styled LINE:
-                         (linostr (propertize (number-to-string line) 'face 'org-insight-lineno-face))
-                         (colon   (propertize ":" 'face 'org-insight-lineno-face))
-                         (disp (concat linostr colon " " txt))
-                         (key  (concat (expand-file-name file) ":" (number-to-string line)))
-                         (wrapped (org-insight--display-wrapped
-                                   input disp key
-                                   'org-insight-file file
-                                   'org-insight-line line
-                                   'mouse-face 'highlight)))
-                    ;; Map REAL candidate -> (FILE . LINE)
-                    (when (hash-table-p org-insight--cand-map)
-                      (puthash wrapped (cons file line) org-insight--cand-map)
-                      ;; lenient fallback key
-                      (puthash disp (cons file line) org-insight--cand-map))
-                    wrapped))
-                (org-insight--items-for-input dir input)))))
+               (let ((trimmed (string-trim input)))
+                 (when (hash-table-p org-insight--cand-map)
+                   (clrhash org-insight--cand-map))
+                 (mapcar
+                  (lambda (it)
+                    (let* ((file (org-insight-item-file it))
+                           (line (org-insight-item-line it))
+                           (txt  (org-insight-item-text it))
+                           ;; display as \"LINE: text\" (no filename), with a styled LINE:
+                           (linostr (propertize (number-to-string line) 'face 'org-insight-lineno-face))
+                           (colon   (propertize ":" 'face 'org-insight-lineno-face))
+                           (disp (concat linostr colon " " txt))
+                           (key  (concat (expand-file-name file) ":" (number-to-string line)))
+                           (wrapped (org-insight--display-wrapped
+                                     trimmed disp key
+                                     'org-insight-file file
+                                     'org-insight-line line
+                                     'mouse-face 'highlight)))
+                      ;; Map REAL candidate -> (FILE . LINE)
+                      (when (hash-table-p org-insight--cand-map)
+                        (puthash wrapped (cons file line) org-insight--cand-map)
+                        ;; lenient fallback key
+                        (puthash disp (cons file line) org-insight--cand-map))
+                      wrapped))
+                  (org-insight--items-for-input dir trimmed))))))
     (org-insight--table-with-metadata
      (completion-table-dynamic gen t)
      '(metadata
