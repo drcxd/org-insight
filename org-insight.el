@@ -562,8 +562,34 @@ Set to a larger value for slower disks or very large trees."
     (nreverse out)))
 
 ;; --- Build candidates from current input
+
+;; Stable flatten: keep first-seen file order; sort lines ascending within each file
+(defun org-insight--sort-items-by-file-and-line (items)
+  "Return ITEMS ordered by first-seen file, with each file's items sorted by line asc."
+  (let ((table (make-hash-table :test 'equal))
+        files-order)
+    (dolist (it items)
+      (let* ((f (org-insight-item-file it))
+             (bucket (gethash f table)))
+        (unless bucket
+          (setq bucket '())
+          (puthash f bucket table)
+          (push f files-order))
+        (puthash f (cons it (gethash f table)) table)))
+    (setq files-order (nreverse files-order))
+    (let (out)
+      (dolist (f files-order)
+        (let* ((bucket (nreverse (gethash f table))))
+          ;; sort lines ascending within this file
+          (setq bucket (sort bucket (lambda (a b)
+                                      (< (org-insight-item-line a)
+                                         (org-insight-item-line b)))))
+          (setq out (nconc out bucket))))
+      out)))
+
 (defun org-insight--items-for-input (dir input)
-  "Return list of `org-insight-item' for DIR and minibuffer INPUT."
+  "Return list of `org-insight-item' for DIR and minibuffer INPUT,
+stable-sorted by (FILE order of first occurrence, then LINE asc)."
   (let* ((kws (org-insight--split-keywords-quoted input))
          (backend (or (and (boundp 'org-insight-backend) org-insight-backend) 'ripgrep))
          (regexp-p (and (boundp 'org-insight-regexp-p) org-insight-regexp-p))
@@ -575,6 +601,7 @@ Set to a larger value for slower disks or very large trees."
          (seen (make-hash-table :test 'equal))
          acc)
     (setq org-insight--current-keywords kws)
+    ;; Gather and dedupe by (file . line)
     (dolist (kw kws)
       (dolist (it (funcall collector dir kw regexp-p))
         (let* ((file (org-insight-item-file it))
@@ -583,7 +610,8 @@ Set to a larger value for slower disks or very large trees."
           (unless (gethash key seen)
             (puthash key t seen)
             (push it acc)))))
-    (nreverse acc)))
+    ;; Stable order: by first-seen file, then line asc
+    (org-insight--sort-items-by-file-and-line (nreverse acc))))
 
 ;; --- Candidate formatting
 (defun org-insight--format-candidate (it input)
@@ -654,6 +682,7 @@ Populates `org-insight--cand-map` keyed by the REAL candidate string."
                   (let* ((file (org-insight-item-file it))
                          (line (org-insight-item-line it))
                          (txt  (org-insight-item-text it))
+                         ;; display as \"LINE: text\" (no filename), with a styled LINE:
                          (linostr (propertize (number-to-string line) 'face 'org-insight-lineno-face))
                          (colon   (propertize ":" 'face 'org-insight-lineno-face))
                          (disp (concat linostr colon " " txt))
@@ -666,7 +695,7 @@ Populates `org-insight--cand-map` keyed by the REAL candidate string."
                     ;; Map REAL candidate -> (FILE . LINE)
                     (when (hash-table-p org-insight--cand-map)
                       (puthash wrapped (cons file line) org-insight--cand-map)
-                      ;; Also map plain display text as a lenient fallback
+                      ;; lenient fallback key
                       (puthash disp (cons file line) org-insight--cand-map))
                     wrapped))
                 (org-insight--items-for-input dir input)))))
@@ -674,8 +703,10 @@ Populates `org-insight--cand-map` keyed by the REAL candidate string."
      (completion-table-dynamic gen t)
      '(metadata
        (category . org-insight)
-       ;; No annotation function -> no trailing [filename]
-       (group-function . org-insight--group)))))
+       (group-function . org-insight--group)
+       ;; CRITICAL: keep the generator order
+       (display-sort-function . identity)
+       (cycle-sort-function . identity)))))
 
 (defconst org-insight--preview-buffer-name "*Org Insight Preview*")
 
@@ -802,18 +833,19 @@ Also force match highlighting to render in pure black for this minibuffer only."
     (define-key map [return]    #'org-insight--vertico-accept-visit)
     (use-local-map map))
 
+  ;; Keep our candidate order
+  (when (boundp 'vertico-sort-function)
+    (setq-local vertico-sort-function nil))
+  (when (boundp 'vertico-group-sort-function)
+    (setq-local vertico-group-sort-function nil))
+
   ;; ----- Make matches black (local to minibuffer) -----
-  ;; 1) If Orderless is in use, make all its match faces black in this buffer.
   (when (boundp 'orderless-match-faces)
-    ;; Ensure we have enough entries; Orderless indexes into this list.
     (setq-local orderless-match-faces
                 (mapcar (lambda (_i) 'org-insight-match-face)
                         (number-sequence 0 9)))
-    ;; Some setups use `orderless-highlight-matches'. Keep it enabled; faces are black.
     (when (boundp 'orderless-highlight-matches)
       (setq-local orderless-highlight-matches t)))
-
-  ;; 2) Remap common completion faces to black as a fallback (non-Orderless styles).
   (let ((faces-to-remap
          '(completions-common-part
            completions-first-difference
