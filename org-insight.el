@@ -490,6 +490,185 @@ Set to a larger value for slower disks or very large trees."
           (forward-line (1- line))
           (recenter '(middle)))))))
 
+;;;; ----------------------------------------------------------------------
+;;;; Vertico integration
+;;;; ----------------------------------------------------------------------
+
+(defgroup org-insight-vertico nil
+  "Vertico-based UI for org-insight."
+  :group 'org-insight)
+
+(defcustom org-insight-use-vertico t
+  "If non-nil and Vertico is available, use Vertico-based UI for `org-insight`."
+  :type 'boolean :group 'org-insight-vertico)
+
+(defcustom org-insight-vertico-preview-side 'right
+  "Which side to show the live preview window."
+  :type '(choice (const left) (const right) (const above) (const below))
+  :group 'org-insight-vertico)
+
+(defcustom org-insight-vertico-preview-width 0.5
+  "Width/height (fraction) of the preview side window."
+  :type '(choice number (const 0.5)) :group 'org-insight-vertico)
+
+(defvar-local org-insight--vertico-last-preview nil
+  "Cache of the last previewed (FILE . LINE) during a Vertico session.")
+
+(defvar org-insight--current-dir nil
+  "Directory used for the ongoing Vertico search session.")
+
+(defvar org-insight--current-keywords nil
+  "Keywords list parsed from current minibuffer input; used for preview highlighting.")
+
+;; --- Utility: split keywords, respecting quotes (\"like this\" or 'like this')
+(defun org-insight--split-keywords-quoted (s)
+  "Split S into keywords, respecting double/single quoted phrases."
+  (let ((pos 0) out)
+    (while (and s (< pos (length s)))
+      (cond
+       ((string-match "\\s-*\"\\([^\"]+\\)\"" s pos)
+        (setq out (cons (match-string 1 s) out)
+              pos (match-end 0)))
+       ((string-match "\\s-*'\\([^']+\\)'" s pos)
+        (setq out (cons (match-string 1 s) out)
+              pos (match-end 0)))
+       ((string-match "\\s-*\\([^ \t\n\r,]+\\)" s pos)
+        (setq out (cons (match-string 1 s) out)
+              pos (match-end 0)))
+       (t (setq pos (1+ pos)))))
+    (nreverse out)))
+
+;; --- Build candidates from current input
+(defun org-insight--items-for-input (dir input)
+  "Return list of `org-insight-item' for DIR and minibuffer INPUT."
+  (let* ((kws (org-insight--split-keywords-quoted input))
+         (backend (or (and (boundp 'org-insight-backend) org-insight-backend) 'ripgrep))
+         (regexp-p (and (boundp 'org-insight-regexp-p) org-insight-regexp-p))
+         (collector
+          (pcase backend
+            ('ripgrep #'org-insight--collect-lines-ripgrep)
+            ('grep    #'org-insight--collect-lines-grep)
+            (_       #'org-insight--collect-lines-elisp)))
+         (seen (make-hash-table :test 'equal))
+         acc)
+    (setq org-insight--current-keywords kws)
+    (dolist (kw kws)
+      (dolist (it (funcall collector dir kw regexp-p))
+        (let* ((file (org-insight-item-file it))
+               (line (org-insight-item-line it))
+               (key  (cons file line)))
+          (unless (gethash key seen)
+            (puthash key t seen)
+            (push it acc)))))
+    (nreverse acc)))
+
+;; --- Candidate formatting
+(defun org-insight--format-candidate (it input)
+  "Return a display string for ITEM IT, text-propertized with FILE/LINE.
+The underlying string *starts with* INPUT (for prefix completion),
+but *displays* as \"file:line: text\"."
+  (let* ((file (org-insight-item-file it))
+         (line (org-insight-item-line it))
+         (txt  (org-insight-item-text it))
+         (disp (format "%s:%d: %s" (abbreviate-file-name file) line txt)))
+    (org-insight--display-wrapped
+     input disp
+     'org-insight-file file
+     'org-insight-line line
+     'mouse-face 'highlight)))
+
+(defun org-insight--annotation (cand)
+  "Annotation function: show base file name."
+  (let* ((file (get-text-property 0 'org-insight-file cand)))
+    (when file
+      (concat "  [" (file-name-nondirectory file) "]"))))
+
+(defun org-insight--group (cand transform)
+  "Group function: group by file name (non-directory)."
+  (if transform cand (file-name-nondirectory (or (get-text-property 0 'org-insight-file cand) ""))))
+
+(defun org-insight--table-with-metadata (table metadata)
+  "Wrap completion TABLE so that (ACTION 'metadata) returns METADATA."
+  (lambda (string pred action)
+    (if (eq action 'metadata)
+        metadata
+      (complete-with-action action table string pred))))
+
+;; Force prefix-match compatibility: wrap CAND so its *actual* text starts
+;; with INPUT, but *display* only shows DISP. This lets prefix-based completion
+;; styles keep our dynamic results visible.
+(defun org-insight--display-wrapped (input disp &rest props)
+  "Return a string that *starts with* INPUT but *displays* DISP.
+Additional PROPS are applied as text properties to the whole candidate."
+  (let* ((real (concat input " ⇨ " disp))  ;; real text = input prefix + arrow + disp
+         (s (apply #'propertize real 'display disp props)))
+    s))
+
+;; --- Dynamic completion table
+(defun org-insight--completion-table (dir)
+  "A completion table that searches DIR from minibuffer input.
+It returns candidates whose *real* text starts with the minibuffer input
+to appease prefix completion, while *displaying* clean result lines."
+  (let ((gen (lambda (input)
+               (mapcar (lambda (it)
+                         (org-insight--format-candidate it input))
+                       (org-insight--items-for-input dir input)))))
+    (org-insight--table-with-metadata
+     (completion-table-dynamic gen t)
+     '(metadata
+       (category . org-insight)
+       (annotation-function . org-insight--annotation)
+       (group-function . org-insight--group)))))
+
+;; --- Preview helper (reuses your highlight/overlay logic if present)
+(defun org-insight--preview-file-line (file line)
+  "Show FILE in a side window and recenter LINE to the middle."
+  (when (and file (integerp line))
+    (let* ((buf (find-file-noselect file))
+           (win (display-buffer-in-side-window
+                 buf `((side . ,org-insight-vertico-preview-side)
+                       (window-width . ,org-insight-vertico-preview-width)
+                       (slot . 0)))))
+      (with-selected-window win
+        (goto-char (point-min))
+        (forward-line (max 0 (1- line)))
+        (recenter)
+        ;; Optional: reuse your preview highlighter if defined
+        (when (fboundp 'org-insight--clear-preview-overlays)
+          (org-insight--clear-preview-overlays))
+        (when (and (fboundp 'org-insight--highlight-keywords-in-buffer)
+                   org-insight--current-keywords)
+          (org-insight--highlight-keywords-in-buffer org-insight--current-keywords))))))
+
+;; --- Live preview on candidate move (minibuffer local)
+(defun org-insight--vertico-preview-post-command ()
+  "Minibuffer-local hook to preview current Vertico candidate."
+  (when (and (bound-and-true-p vertico-mode)
+             (boundp 'vertico--index)
+             (>= vertico--index 0))
+    (let* ((cand (ignore-errors (funcall (intern "vertico--candidate"))))
+           (file (and cand (get-text-property 0 'org-insight-file cand)))
+           (line (and cand (get-text-property 0 'org-insight-line cand)))
+           (key  (and file line (cons file line))))
+      (when (and file line (not (equal key org-insight--vertico-last-preview)))
+        (setq org-insight--vertico-last-preview key)
+        (org-insight--preview-file-line file line)))))
+
+(defun org-insight--minibuffer-setup ()
+  "Setup live preview during `org-insight' minibuffer session."
+  (add-hook 'post-command-hook #'org-insight--vertico-preview-post-command nil t))
+
+(defun org-insight--visit-candidate (cand)
+  "Visit CAND by opening file and jumping to line."
+  (let ((file (get-text-property 0 'org-insight-file cand))
+        (line (get-text-property 0 'org-insight-line cand)))
+    (unless (and file line)
+      (user-error "Invalid selection: missing file/line properties"))
+    (find-file file)
+    (goto-char (point-min))
+    (forward-line (max 0 (1- line)))
+    (recenter)))
+
 ;; -----------------------------------------------------------------------------
 ;; Movement (results & file groups)
 ;; -----------------------------------------------------------------------------
@@ -715,108 +894,35 @@ restore windows when 'replace was used."
 ;; -----------------------------------------------------------------------------
 
 ;;;###autoload
-(defun org-insight (&optional display-fn)
-  "Search recursively with grouped results and whole-file preview.
+(defun org-insight (&optional dir)
+  "Search org/plaintext files and jump to results.
 
-- Type keywords separated by spaces/commas.
-- Toggle AND/OR with C-c C-o (message shows current operator).
-- Live preview updates after an idle delay; the preview window is created *before* prompting.
-
-Uses `org-insight-default-directory` if set; otherwise prompts for a directory.
-
-Optional DISPLAY-FN is (lambda FILE -> DISPLAY-NAME)."
+Uses Vertico when available and `org-insight-use-vertico' is non-nil.
+Does NOT prompt for a directory; instead reuses `org-insight-default-directory'.
+If that is nil, falls back to project root (via .git) or `default-directory`."
   (interactive)
-  (let* ((dir (or org-insight-default-directory
-                  (read-directory-name "Directory: ")))
-         (regexp-p org-insight-use-regexp)
-         (disp-fn (or display-fn #'org-insight--default-display-name))
-         (local-map (let ((m (make-sparse-keymap)))
-                      (set-keymap-parent m minibuffer-local-map)
-                      (define-key m (kbd "C-c C-o") #'org-insight--toggle-operator-during-entry)
-                      m))
-         ;; Pre-create the live preview view (window or frame) in the chosen dir
-         (_pre (when org-insight-live-preview
-                 (let ((default-directory dir))
-                   (org-insight--ensure-live-visible))))
-         (prompt "Keywords: "))
-    (let* ((input (unwind-protect (minibuffer-with-setup-hook
-                                      (lambda ()
-                                        (use-local-map local-map)
-                                        (setq-local org-insight--entry-operator org-insight-default-operator)
-                                        (when org-insight-live-preview
-                                          (let* ((mb (current-buffer)))
-                                            ;; Called by the idle timer to compute & render preview NOW.
-                                            (cl-labels
-                                                ((refresh-now ()
-                                                   (when (buffer-live-p mb)
-                                                     (with-current-buffer mb
-                                                       (let* ((s (buffer-substring-no-properties
-                                                                  (minibuffer-prompt-end) (point-max)))
-                                                              (trim (string-trim s)))
-                                                         (if (< (length trim) org-insight-live-preview-min-chars)
-                                                             (org-insight--render-live-buffer nil "—" dir)
-                                                           (let* ((kws (org-insight--split-keywords trim)))
-                                                             (if (null kws)
-                                                                 (org-insight--render-live-buffer nil "—" dir)
-                                                               (let* ((op (if (> (length kws) 1)
-                                                                              org-insight--entry-operator
-                                                                            org-insight-default-operator))
-                                                                      (backend org-insight-live-preview-backend)
-                                                                      (lists (mapcar (lambda (kw)
-                                                                                       (org-insight--collect-one backend dir kw regexp-p))
-                                                                                     kws))
-                                                                      (items  (org-insight--combine-items lists op))
-                                                                      (groups (org-insight--group-items-by-file
-                                                                               items (or disp-fn #'org-insight--default-display-name)))
-                                                                      (header (if (= (length kws) 1)
-                                                                                  (car kws)
-                                                                                (mapconcat #'identity
-                                                                                           kws
-                                                                                           (if (eq op 'and) " & " " | ")))))
-                                                                 (org-insight--render-live-buffer groups header dir))))))))))
-                                              ;; A closure we can safely add/remove from hooks:
-                                              (setq-local org-insight--live-schedule-fn
-                                                          (lambda (&rest _)
-                                                            (when (timerp org-insight--live-idle-timer)
-                                                              (cancel-timer org-insight--live-idle-timer))
-                                                            (setq org-insight--live-idle-timer
-                                                                  (run-with-idle-timer
-                                                                   org-insight-live-preview-debounce
-                                                                   nil
-                                                                   (lambda ()
-                                                                     (when (buffer-live-p mb)
-                                                                       (with-current-buffer mb
-                                                                         (refresh-now))))))))
-                                              ;; Expose manual kick for C-c C-o
-                                              (setq-local org-insight--live-kick-fn
-                                                          (lambda () (funcall org-insight--live-schedule-fn)))
-                                              ;; On any edit, just reschedule the idle timer.
-                                              (add-hook 'post-self-insert-hook org-insight--live-schedule-fn nil t)
-                                              (add-hook 'post-command-hook      org-insight--live-schedule-fn nil t)
-                                              ;; Cleanup on exit: remove hooks and cancel timer.
-                                              (let (cleanup)
-                                                (setq cleanup
-                                                      (lambda ()
-                                                        (when org-insight-live-preview-close-on-exit
-                                                          (org-insight--close-live))
-                                                        (when (timerp org-insight--live-idle-timer)
-                                                          (cancel-timer org-insight--live-idle-timer))
-                                                        (remove-hook 'post-self-insert-hook org-insight--live-schedule-fn t)
-                                                        (remove-hook 'post-command-hook      org-insight--live-schedule-fn t)
-                                                        (setq org-insight--live-idle-timer nil
-                                                              org-insight--live-schedule-fn nil
-                                                              org-insight--live-kick-fn nil)
-                                                        (remove-hook 'minibuffer-exit-hook cleanup)))
-                                                (add-hook 'minibuffer-exit-hook cleanup))))))
-                                    (read-from-minibuffer prompt
-                                                          nil nil nil 'org-insight-keyword-history))
-                    (org-insight--close-live)))
-           (keywords (or (org-insight--split-keywords input)
-                         (user-error "No keywords provided")))
-           (operator (if (> (length keywords) 1)
-                         org-insight--entry-operator
-                       org-insight-default-operator)))
-      (org-insight--run dir keywords operator regexp-p disp-fn))))
+  (require 'subr-x) ;; for string-empty-p
+  (let* ((base (or dir
+                   (and (boundp 'org-insight-default-directory)
+                        org-insight-default-directory)
+                   (ignore-errors (locate-dominating-file default-directory ".git"))
+                   default-directory))
+         (use-vertico (and (boundp 'org-insight-use-vertico)
+                           org-insight-use-vertico
+                           (featurep 'vertico))))
+    (if (not use-vertico)
+        (progn
+          (if (fboundp 'org-insight--legacy-ui)
+              (org-insight--legacy-ui base)
+            (user-error "Vertico not available and no legacy UI function `org-insight--legacy-ui' found.")))
+      (let* ((org-insight--current-dir base)
+             (minibuffer-allow-text-properties t)
+             (table (org-insight--completion-table base))
+             (prompt (format "Org Insight (%s): " (abbreviate-file-name base))))
+        (minibuffer-with-setup-hook #'org-insight--minibuffer-setup
+          (let ((selection (completing-read prompt table nil t "")))
+            (when (and selection (not (string-empty-p selection)))
+              (org-insight--visit-candidate selection))))))))
 
 (provide 'org-insight)
 ;;; org-insight.el ends here
