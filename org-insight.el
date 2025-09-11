@@ -267,11 +267,16 @@ Set to a larger value for slower disks or very large trees."
          (t (error "%s failed with exit code %s\n%s" program status (buffer-string))))))))
 
 (defun org-insight--collect-lines-ripgrep (dir keyword regexp-p)
+  "Collect matches using ripgrep in DIR for KEYWORD.
+Respects smart-case and avoids truncating long lines."
   (unless (executable-find "rg")
     (error "ripgrep (rg) not found; set backend to 'grep or 'emacs"))
   (let* ((args (append org-insight-ripgrep-extra-args
-                       '("--with-filename" "--line-number")
+                       ;; Always ask for file, line; never truncate long lines; smart-case.
+                       '("--with-filename" "--line-number" "--max-columns=0" "-S")
+                       ;; Use fixed string unless regexp requested.
                        (unless regexp-p '("-F"))
+                       ;; Pattern and search root.
                        (list "--" keyword ".")))
          (lines (org-insight--call-process-lines "rg" args dir))
          items)
@@ -284,10 +289,18 @@ Set to a larger value for slower disks or very large trees."
     (nreverse items)))
 
 (defun org-insight--collect-lines-grep (dir keyword regexp-p)
+  "Collect matches using GNU grep in DIR for KEYWORD.
+Honors `case-fold-search' for case-insensitive search."
   (unless (executable-find "grep")
     (error "grep not found; set backend to 'ripgrep or 'emacs"))
   (let* ((mode-flag (if regexp-p "-E" "-F"))
-         (args (append org-insight-grep-extra-args (list mode-flag "--" keyword ".")))
+         ;; If the user typed all-lowercase and Emacs would fold case, use -i.
+         (need-ci (and case-fold-search
+                       (string= keyword (downcase keyword))))
+         (args (append org-insight-grep-extra-args
+                       (list mode-flag)
+                       (when need-ci '("-i"))
+                       (list "--" keyword ".")))
          (lines (org-insight--call-process-lines "grep" args dir))
          items)
     (dolist (ln lines)
@@ -330,7 +343,15 @@ Set to a larger value for slower disks or very large trees."
                (unless (gethash k seen)
                  (puthash k it seen)
                  (push it out)))))
-         (nreverse out)))
+         ;; Ensure deterministic order: by file, then line.
+         (setq out (sort out
+                         (lambda (a b)
+                           (let ((fa (org-insight-item-file a))
+                                 (fb (org-insight-item-file b))
+                                 (la (org-insight-item-line a))
+                                 (lb (org-insight-item-line b)))
+                             (if (string= fa fb) (< la lb) (string< fa fb))))))
+         out))
       ('and
        (let ((count (make-hash-table :test 'equal))
              (store (make-hash-table :test 'equal)))
