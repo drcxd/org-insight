@@ -587,15 +587,18 @@ Set to a larger value for slower disks or very large trees."
 
 ;; --- Candidate formatting
 (defun org-insight--format-candidate (it input)
-  "Return a display string for ITEM IT, text-propertized with FILE/LINE.
-The underlying string *starts with* INPUT (for prefix completion),
-but *displays* as \"file:line: text\"."
+  "Format a single ITEM for display as \"LINE: MATCH\" (no filename),
+styling the LINE: prefix with `org-insight-lineno-face`."
   (let* ((file (org-insight-item-file it))
          (line (org-insight-item-line it))
          (txt  (org-insight-item-text it))
-         (disp (format "%s:%d: %s" (abbreviate-file-name file) line txt)))
+         (linostr (propertize (number-to-string line) 'face 'org-insight-lineno-face))
+         (colon   (propertize ":" 'face 'org-insight-lineno-face))
+         (disp (concat linostr colon " " txt))
+         ;; Unique key ties the display back to its source even if DISP duplicates
+         (key  (concat (expand-file-name file) ":" (number-to-string line))))
     (org-insight--display-wrapped
-     input disp
+     input disp key
      'org-insight-file file
      'org-insight-line line
      'mouse-face 'highlight)))
@@ -607,19 +610,18 @@ but *displays* as \"file:line: text\"."
       (concat "  [" (file-name-nondirectory file) "]"))))
 
 (defun org-insight--group (cand transform)
-  "Group candidates by file; use Org #+title if present.
-When TRANSFORM is non-nil, return CAND unchanged (per completion UI contract)."
+  "Group candidates by file; prefer Org #+title if present.
+When TRANSFORM is non-nil, return CAND unchanged."
   (if transform
       cand
-    (let ((file (or (get-text-property 0 'org-insight-file cand)
-                    ;; Fallback: unwrap displayed text to look up mapping if needed
-                    (let* ((key (and (stringp cand)
-                                     (if (string-match "\\`.*?⇨ \\(.*\\)\\'" cand)
-                                         (match-string 1 cand)
-                                       cand))))
-                      (when (and (boundp 'org-insight--cand-map)
-                                 (hash-table-p org-insight--cand-map))
-                        (car (gethash key org-insight--cand-map)))))))
+    (let* ((file (or (get-text-property 0 'org-insight-file cand)
+                     (and (hash-table-p org-insight--cand-map)
+                          (or (car-safe (gethash cand org-insight--cand-map))
+                              (let* ((key (and (stringp cand)
+                                               (if (string-match "\\`.*?⇨ \\(.*\\)\\'" cand)
+                                                   (match-string 1 cand)
+                                                 cand))))
+                                (and key (car-safe (gethash key org-insight--cand-map)))))))))
       (org-insight--file-group-name file))))
 
 (defun org-insight--table-with-metadata (table metadata)
@@ -629,20 +631,21 @@ When TRANSFORM is non-nil, return CAND unchanged (per completion UI contract)."
         metadata
       (complete-with-action action table string pred))))
 
-;; Force prefix-match compatibility: wrap CAND so its *actual* text starts
-;; with INPUT, but *display* only shows DISP. This lets prefix-based completion
-;; styles keep our dynamic results visible.
-(defun org-insight--display-wrapped (input disp &rest props)
-  "Return a string that *starts with* INPUT but *displays* DISP.
-Additional PROPS are applied as text properties to the whole candidate."
-  (let* ((real (concat input " ⇨ " disp))  ;; real text = input prefix + arrow + disp
+;; Force prefix-match compatibility, and keep a unique hidden key.
+;; The *real* candidate string becomes: "INPUT ⇨ DISP \x1F KEY"
+;; but the minibuffer *displays* only DISP via the `display` property.
+(defun org-insight--display-wrapped (input disp &optional key &rest props)
+  "Return a string that STARTS WITH INPUT but DISPLAYS as DISP.
+KEY (optional) is appended to the real string (hidden by `display`) to keep it unique.
+Additional PROPS are added as text properties."
+  (let* ((real (concat input " ⇨ " disp (if key (concat "\x1F" key) "")))
          (s (apply #'propertize real 'display disp props)))
     s))
 
 ;; --- Dynamic completion table
 (defun org-insight--completion-table (dir)
   "A completion table that searches DIR from minibuffer input.
-Rebuilds `org-insight--cand-map` for each INPUT."
+Populates `org-insight--cand-map` keyed by the REAL candidate string."
   (let ((gen (lambda (input)
                (when (hash-table-p org-insight--cand-map)
                  (clrhash org-insight--cand-map))
@@ -651,26 +654,27 @@ Rebuilds `org-insight--cand-map` for each INPUT."
                   (let* ((file (org-insight-item-file it))
                          (line (org-insight-item-line it))
                          (txt  (org-insight-item-text it))
-                         (disp (format "%s:%d: %s"
-                                       (abbreviate-file-name file) line txt))
+                         (linostr (propertize (number-to-string line) 'face 'org-insight-lineno-face))
+                         (colon   (propertize ":" 'face 'org-insight-lineno-face))
+                         (disp (concat linostr colon " " txt))
+                         (key  (concat (expand-file-name file) ":" (number-to-string line)))
                          (wrapped (org-insight--display-wrapped
-                                   input disp
+                                   input disp key
                                    'org-insight-file file
                                    'org-insight-line line
                                    'mouse-face 'highlight)))
-                    ;; Map both the visible text and the underlying wrapped text
-                    ;; to (FILE . LINE), so we can resolve either form.
+                    ;; Map REAL candidate -> (FILE . LINE)
                     (when (hash-table-p org-insight--cand-map)
-                      (puthash disp (cons file line) org-insight--cand-map)
-                      (puthash (concat input " ⇨ " disp)
-                               (cons file line) org-insight--cand-map))
+                      (puthash wrapped (cons file line) org-insight--cand-map)
+                      ;; Also map plain display text as a lenient fallback
+                      (puthash disp (cons file line) org-insight--cand-map))
                     wrapped))
                 (org-insight--items-for-input dir input)))))
     (org-insight--table-with-metadata
      (completion-table-dynamic gen t)
      '(metadata
        (category . org-insight)
-       (annotation-function . org-insight--annotation)
+       ;; No annotation function -> no trailing [filename]
        (group-function . org-insight--group)))))
 
 (defconst org-insight--preview-buffer-name "*Org Insight Preview*")
@@ -743,13 +747,15 @@ Also restores keyword highlighting."
              (boundp 'vertico--index)
              (>= vertico--index 0))
     (let* ((cand (ignore-errors (funcall (intern "vertico--candidate"))))
-           (key  (and cand (org-insight--unwrap-candidate cand)))
-           (pair (and key (hash-table-p org-insight--cand-map)
-                      (gethash key org-insight--cand-map)))
+           (pair (and cand (hash-table-p org-insight--cand-map)
+                      (gethash cand org-insight--cand-map)))
+           ;; Fallback to unwrapped display text only if needed
+           (pair (or pair
+                     (let* ((key (and cand (org-insight--unwrap-candidate cand))))
+                       (and key (gethash key org-insight--cand-map)))))
            (file (car-safe pair))
            (line (cdr-safe pair)))
       (when (and file line)
-        ;; Remember last previewed (FILE . LINE) to avoid unnecessary reloads.
         (setq org-insight--vertico-last-preview (cons file line))
         (org-insight--preview-file-line file line)))))
 
@@ -785,15 +791,40 @@ Also restores keyword highlighting."
               (push ov org-insight--preview-overlays))))))))
 
 (defun org-insight--minibuffer-setup ()
-  "Setup live preview and RET behavior for this one minibuffer only."
+  "Setup live preview and keybindings during `org-insight` minibuffer session.
+Also force match highlighting to render in pure black for this minibuffer only."
   (add-hook 'post-command-hook #'org-insight--vertico-preview-post-command nil t)
-  ;; Do NOT mutate the global map; compose a local one for this minibuffer.
+  ;; Bind RET locally for visit
   (let* ((parent (current-local-map))
          (map (make-sparse-keymap)))
     (set-keymap-parent map parent)
     (define-key map (kbd "RET") #'org-insight--vertico-accept-visit)
     (define-key map [return]    #'org-insight--vertico-accept-visit)
-    (use-local-map map)))
+    (use-local-map map))
+
+  ;; ----- Make matches black (local to minibuffer) -----
+  ;; 1) If Orderless is in use, make all its match faces black in this buffer.
+  (when (boundp 'orderless-match-faces)
+    ;; Ensure we have enough entries; Orderless indexes into this list.
+    (setq-local orderless-match-faces
+                (mapcar (lambda (_i) 'org-insight-match-face)
+                        (number-sequence 0 9)))
+    ;; Some setups use `orderless-highlight-matches'. Keep it enabled; faces are black.
+    (when (boundp 'orderless-highlight-matches)
+      (setq-local orderless-highlight-matches t)))
+
+  ;; 2) Remap common completion faces to black as a fallback (non-Orderless styles).
+  (let ((faces-to-remap
+         '(completions-common-part
+           completions-first-difference
+           orderless-match-face-0 orderless-match-face-1
+           orderless-match-face-2 orderless-match-face-3
+           orderless-match-face-4 orderless-match-face-5
+           orderless-match-face-6 orderless-match-face-7
+           orderless-match-face-8 orderless-match-face-9)))
+    (dolist (ff faces-to-remap)
+      (when (facep ff)
+        (face-remap-add-relative ff 'org-insight-match-face)))))
 
 (defun org-insight--visit-candidate (cand &optional window)
   "Visit CAND by opening file and jumping to line in WINDOW (default: selected)."
@@ -816,9 +847,11 @@ Also restores keyword highlighting."
   (interactive)
   (let* ((cand (when (and (boundp 'vertico--index) (>= vertico--index 0))
                  (ignore-errors (funcall (intern "vertico--candidate")))))
-         (key  (and cand (org-insight--unwrap-candidate cand)))
-         (pair (and key (hash-table-p org-insight--cand-map)
-                    (gethash key org-insight--cand-map)))
+         (pair (and cand (hash-table-p org-insight--cand-map)
+                    (gethash cand org-insight--cand-map)))
+         (pair (or pair
+                   (let* ((key (and cand (org-insight--unwrap-candidate cand))))
+                     (and key (gethash key org-insight--cand-map)))))
          (file (car-safe pair))
          (line (cdr-safe pair))
          (target (or org-insight--calling-window
@@ -828,13 +861,7 @@ Also restores keyword highlighting."
     (unless (and file line)
       (user-error "Invalid selection: missing file/line (no mapping for candidate)"))
     (setq org-insight--visit-triggered t)
-    ;; Defer until after minibuffer exits, so window selection sticks.
     (run-at-time 0 nil #'org-insight--visit-file-line-in-window file line target)
-    ;; Optional: close preview window right after accept
-    ;; (run-at-time 0 nil
-    ;;              (lambda ()
-    ;;                (when-let ((win (get-buffer-window org-insight--preview-buffer-name)))
-    ;;                  (when (window-live-p win) (delete-window win)))))
     (exit-minibuffer)))
 
 ;; ---------- Org title lookup (fast, no visiting) ----------
@@ -865,6 +892,14 @@ Reads only the first ~8KB without visiting the file."
   "Return the display name for grouping: Org #+title or file base name."
   (or (org-insight--org-file-title-fast file)
       (file-name-nondirectory (or file ""))))
+
+(defface org-insight-lineno-face
+  '((t :inherit shadow :weight semibold))
+  "Face used for the \"LINE:\" prefix in Org Insight candidates.")
+
+(defface org-insight-match-face
+  '((t :foreground "black"))
+  "Face used to render matched parts of candidates in the Vertico list.")
 
 ;; -----------------------------------------------------------------------------
 ;; Movement (results & file groups)
