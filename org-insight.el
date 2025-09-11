@@ -620,25 +620,64 @@ to appease prefix completion, while *displaying* clean result lines."
        (annotation-function . org-insight--annotation)
        (group-function . org-insight--group)))))
 
+(defconst org-insight--preview-buffer-name "*Org Insight Preview*")
+
+(defun org-insight--get-preview-buffer ()
+  "Return the single, reusable preview buffer (not visiting any file)."
+  (or (get-buffer org-insight--preview-buffer-name)
+      (let ((buf (get-buffer-create org-insight--preview-buffer-name)))
+        (with-current-buffer buf
+          (setq-local buffer-read-only t)
+          (setq-local buffer-undo-list t)   ;; disable undo growth
+          (setq-local truncate-lines t))
+        buf)))
+
+(defun org-insight--preview-load-file-contents (buf file)
+  "Load FILE's contents into BUF (scratch), set mode, and record current file."
+  (with-current-buffer buf
+    (let ((inhibit-read-only t))
+      (erase-buffer)
+      (insert-file-contents file nil nil nil) ; do not visit
+      ;; Set major mode by pretending to be FILE just for mode detection
+      (let ((buffer-file-name file))
+        (set-auto-mode))
+      (setq-local buffer-file-name nil)
+      (setq-local org-insight--preview-current-file file)
+      (goto-char (point-min)))))
+
 ;; --- Preview helper (reuses your highlight/overlay logic if present)
 (defun org-insight--preview-file-line (file line)
-  "Show FILE in a side window and recenter LINE to the middle."
+  "Show FILE in the reusable side-window and center LINE.
+Reloads content only when FILE differs from what's currently shown.
+Also restores keyword highlighting."
   (when (and file (integerp line))
-    (let* ((buf (find-file-noselect file))
+    (let* ((buf (org-insight--get-preview-buffer))
            (win (display-buffer-in-side-window
                  buf `((side . ,org-insight-vertico-preview-side)
                        (window-width . ,org-insight-vertico-preview-width)
                        (slot . 0)))))
+      ;; Reload only if the buffer isn't already showing this file.
+      (with-current-buffer buf
+        (unless (and (boundp 'org-insight--preview-current-file)
+                     (stringp org-insight--preview-current-file)
+                     (string-equal org-insight--preview-current-file file))
+          (org-insight--preview-load-file-contents buf file)))
+      ;; Jump, center, and (re)highlight.
       (with-selected-window win
         (goto-char (point-min))
         (forward-line (max 0 (1- line)))
-        (recenter)
-        ;; Optional: reuse your preview highlighter if defined
-        (when (fboundp 'org-insight--clear-preview-overlays)
-          (org-insight--clear-preview-overlays))
-        (when (and (fboundp 'org-insight--highlight-keywords-in-buffer)
-                   org-insight--current-keywords)
-          (org-insight--highlight-keywords-in-buffer org-insight--current-keywords))))))
+        (recenter) ; center the current line in the window
+        ;; If your original helpers exist, use them; otherwise use ours.
+        (cond
+         ((and (fboundp 'org-insight--clear-preview-overlays)
+               (fboundp 'org-insight--highlight-keywords-in-buffer)
+               (boundp 'org-insight--current-keywords))
+          (org-insight--clear-preview-overlays)
+          (org-insight--highlight-keywords-in-buffer org-insight--current-keywords))
+         (t
+          (org-insight--preview-highlight-keywords
+           org-insight--current-keywords
+           (and (boundp 'org-insight-regexp-p) org-insight-regexp-p))))))))
 
 ;; --- Live preview on candidate move (minibuffer local)
 (defun org-insight--vertico-preview-post-command ()
@@ -653,6 +692,37 @@ to appease prefix completion, while *displaying* clean result lines."
       (when (and file line (not (equal key org-insight--vertico-last-preview)))
         (setq org-insight--vertico-last-preview key)
         (org-insight--preview-file-line file line)))))
+
+;; One reusable preview buffer (already defined earlier)
+(defconst org-insight--preview-buffer-name "*Org Insight Preview*")
+
+;; Track what file is currently displayed in the preview buffer
+(defvar-local org-insight--preview-current-file nil)
+(defvar-local org-insight--preview-overlays nil)
+
+;; A face for keyword highlights (keeps theme-friendly defaults)
+(defface org-insight-highlight-face
+  '((t :inherit highlight :weight bold))
+  "Face for keyword highlights in the preview buffer.")
+
+(defun org-insight--preview-clear-overlays ()
+  "Clear temp highlight overlays in the preview buffer."
+  (when org-insight--preview-overlays
+    (mapc #'delete-overlay org-insight--preview-overlays)
+    (setq org-insight--preview-overlays nil)))
+
+(defun org-insight--preview-highlight-keywords (keywords regexp-p)
+  "Highlight KEYWORDS in current buffer. Respect REGEXP-P for regex vs literal."
+  (org-insight--preview-clear-overlays)
+  (when (and keywords (consp keywords))
+    (save-excursion
+      (dolist (kw keywords)
+        (let ((re (if regexp-p kw (regexp-quote kw))))
+          (goto-char (point-min))
+          (while (re-search-forward re nil t)
+            (let ((ov (make-overlay (match-beginning 0) (match-end 0))))
+              (overlay-put ov 'face 'org-insight-highlight-face)
+              (push ov org-insight--preview-overlays))))))))
 
 (defun org-insight--minibuffer-setup ()
   "Setup live preview during `org-insight' minibuffer session."
