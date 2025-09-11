@@ -494,6 +494,29 @@ Set to a larger value for slower disks or very large trees."
 ;;;; Vertico integration
 ;;;; ----------------------------------------------------------------------
 
+(defvar org-insight--calling-window nil
+  "The window that was selected when the Vertico session started.")
+
+(defun org-insight--visit-file-line-in-window (file line window)
+  "Show FILE and move to LINE in WINDOW, ignoring display rules."
+  (let ((buf (find-file-noselect file)))
+    (when (window-live-p window)
+      (select-window window))
+    (set-window-buffer window buf)
+    (with-selected-window window
+      (goto-char (point-min))
+      (forward-line (max 0 (1- line)))
+      (recenter))))
+
+(defvar org-insight--cand-map nil
+  "Hash table mapping displayed candidate text to (FILE . LINE) for the active session.")
+
+(defun org-insight--unwrap-candidate (cand)
+  "Strip the artificial prefix \"… ⇨ \" from CAND, returning the displayed text."
+  (if (string-match "\\`.*?⇨ \\(.*\\)\\'" cand)
+      (match-string 1 cand)
+    cand))
+
 (defgroup org-insight-vertico nil
   "Vertico-based UI for org-insight."
   :group 'org-insight)
@@ -607,12 +630,30 @@ Additional PROPS are applied as text properties to the whole candidate."
 ;; --- Dynamic completion table
 (defun org-insight--completion-table (dir)
   "A completion table that searches DIR from minibuffer input.
-It returns candidates whose *real* text starts with the minibuffer input
-to appease prefix completion, while *displaying* clean result lines."
+Rebuilds `org-insight--cand-map` for each INPUT."
   (let ((gen (lambda (input)
-               (mapcar (lambda (it)
-                         (org-insight--format-candidate it input))
-                       (org-insight--items-for-input dir input)))))
+               (when (hash-table-p org-insight--cand-map)
+                 (clrhash org-insight--cand-map))
+               (mapcar
+                (lambda (it)
+                  (let* ((file (org-insight-item-file it))
+                         (line (org-insight-item-line it))
+                         (txt  (org-insight-item-text it))
+                         (disp (format "%s:%d: %s"
+                                       (abbreviate-file-name file) line txt))
+                         (wrapped (org-insight--display-wrapped
+                                   input disp
+                                   'org-insight-file file
+                                   'org-insight-line line
+                                   'mouse-face 'highlight)))
+                    ;; Map both the visible text and the underlying wrapped text
+                    ;; to (FILE . LINE), so we can resolve either form.
+                    (when (hash-table-p org-insight--cand-map)
+                      (puthash disp (cons file line) org-insight--cand-map)
+                      (puthash (concat input " ⇨ " disp)
+                               (cons file line) org-insight--cand-map))
+                    wrapped))
+                (org-insight--items-for-input dir input)))))
     (org-insight--table-with-metadata
      (completion-table-dynamic gen t)
      '(metadata
@@ -655,8 +696,13 @@ Also restores keyword highlighting."
            (win (display-buffer-in-side-window
                  buf `((side . ,org-insight-vertico-preview-side)
                        (window-width . ,org-insight-vertico-preview-width)
-                       (slot . 0)))))
-      ;; Reload only if the buffer isn't already showing this file.
+                       (slot . 0)
+                       (window-parameters . ((no-other-window . t)
+                                             (no-delete-other-windows . t)))))))
+      ;; Make sure Emacs never reuses this window for the visited file.
+      (when (window-live-p win)
+        (set-window-dedicated-p win t))
+      ;; Reload contents if needed.
       (with-current-buffer buf
         (unless (and (boundp 'org-insight--preview-current-file)
                      (stringp org-insight--preview-current-file)
@@ -666,8 +712,7 @@ Also restores keyword highlighting."
       (with-selected-window win
         (goto-char (point-min))
         (forward-line (max 0 (1- line)))
-        (recenter) ; center the current line in the window
-        ;; If your original helpers exist, use them; otherwise use ours.
+        (recenter)
         (cond
          ((and (fboundp 'org-insight--clear-preview-overlays)
                (fboundp 'org-insight--highlight-keywords-in-buffer)
@@ -686,11 +731,14 @@ Also restores keyword highlighting."
              (boundp 'vertico--index)
              (>= vertico--index 0))
     (let* ((cand (ignore-errors (funcall (intern "vertico--candidate"))))
-           (file (and cand (get-text-property 0 'org-insight-file cand)))
-           (line (and cand (get-text-property 0 'org-insight-line cand)))
-           (key  (and file line (cons file line))))
-      (when (and file line (not (equal key org-insight--vertico-last-preview)))
-        (setq org-insight--vertico-last-preview key)
+           (key  (and cand (org-insight--unwrap-candidate cand)))
+           (pair (and key (hash-table-p org-insight--cand-map)
+                      (gethash key org-insight--cand-map)))
+           (file (car-safe pair))
+           (line (cdr-safe pair)))
+      (when (and file line)
+        ;; Remember last previewed (FILE . LINE) to avoid unnecessary reloads.
+        (setq org-insight--vertico-last-preview (cons file line))
         (org-insight--preview-file-line file line)))))
 
 ;; One reusable preview buffer (already defined earlier)
@@ -725,19 +773,57 @@ Also restores keyword highlighting."
               (push ov org-insight--preview-overlays))))))))
 
 (defun org-insight--minibuffer-setup ()
-  "Setup live preview during `org-insight' minibuffer session."
-  (add-hook 'post-command-hook #'org-insight--vertico-preview-post-command nil t))
+  "Setup live preview and RET behavior for this one minibuffer only."
+  (add-hook 'post-command-hook #'org-insight--vertico-preview-post-command nil t)
+  ;; Do NOT mutate the global map; compose a local one for this minibuffer.
+  (let* ((parent (current-local-map))
+         (map (make-sparse-keymap)))
+    (set-keymap-parent map parent)
+    (define-key map (kbd "RET") #'org-insight--vertico-accept-visit)
+    (define-key map [return]    #'org-insight--vertico-accept-visit)
+    (use-local-map map)))
 
-(defun org-insight--visit-candidate (cand)
-  "Visit CAND by opening file and jumping to line."
-  (let ((file (get-text-property 0 'org-insight-file cand))
-        (line (get-text-property 0 'org-insight-line cand)))
+(defun org-insight--visit-candidate (cand &optional window)
+  "Visit CAND by opening file and jumping to line in WINDOW (default: selected)."
+  (let* ((prop-file (and (stringp cand) (get-text-property 0 'org-insight-file cand)))
+         (prop-line (and (stringp cand) (get-text-property 0 'org-insight-line cand)))
+         (key (and (stringp cand) (org-insight--unwrap-candidate cand)))
+         (pair (and (not prop-file) key (hash-table-p org-insight--cand-map)
+                    (gethash key org-insight--cand-map)))
+         (file (or prop-file (car-safe pair)))
+         (line (or prop-line (cdr-safe pair))))
     (unless (and file line)
       (user-error "Invalid selection: missing file/line properties"))
-    (find-file file)
-    (goto-char (point-min))
-    (forward-line (max 0 (1- line)))
-    (recenter)))
+    (org-insight--visit-file-line-in-window file line (or window (selected-window)))))
+
+(defvar org-insight--visit-triggered nil
+  "Non-nil while a Vertico accept has visited a candidate.")
+
+(defun org-insight--vertico-accept-visit ()
+  "Visit the highlighted candidate in the original window and exit minibuffer."
+  (interactive)
+  (let* ((cand (when (and (boundp 'vertico--index) (>= vertico--index 0))
+                 (ignore-errors (funcall (intern "vertico--candidate")))))
+         (key  (and cand (org-insight--unwrap-candidate cand)))
+         (pair (and key (hash-table-p org-insight--cand-map)
+                    (gethash key org-insight--cand-map)))
+         (file (car-safe pair))
+         (line (cdr-safe pair))
+         (target (or org-insight--calling-window
+                     (and (fboundp 'minibuffer-selected-window)
+                          (minibuffer-selected-window))
+                     (selected-window))))
+    (unless (and file line)
+      (user-error "Invalid selection: missing file/line (no mapping for candidate)"))
+    (setq org-insight--visit-triggered t)
+    ;; Defer until after minibuffer exits, so window selection sticks.
+    (run-at-time 0 nil #'org-insight--visit-file-line-in-window file line target)
+    ;; Optional: close preview window right after accept
+    ;; (run-at-time 0 nil
+    ;;              (lambda ()
+    ;;                (when-let ((win (get-buffer-window org-insight--preview-buffer-name)))
+    ;;                  (when (window-live-p win) (delete-window win)))))
+    (exit-minibuffer)))
 
 ;; -----------------------------------------------------------------------------
 ;; Movement (results & file groups)
@@ -968,10 +1054,9 @@ restore windows when 'replace was used."
   "Search org/plaintext files and jump to results.
 
 Uses Vertico when available and `org-insight-use-vertico' is non-nil.
-Does NOT prompt for a directory; instead reuses `org-insight-default-directory'.
-If that is nil, falls back to project root (via .git) or `default-directory`."
+Does NOT prompt for a directory; reuses `org-insight-default-directory'."
   (interactive)
-  (require 'subr-x) ;; for string-empty-p
+  (require 'subr-x)
   (let* ((base (or dir
                    (and (boundp 'org-insight-default-directory)
                         org-insight-default-directory)
@@ -981,18 +1066,32 @@ If that is nil, falls back to project root (via .git) or `default-directory`."
                            org-insight-use-vertico
                            (featurep 'vertico))))
     (if (not use-vertico)
-        (progn
-          (if (fboundp 'org-insight--legacy-ui)
-              (org-insight--legacy-ui base)
-            (user-error "Vertico not available and no legacy UI function `org-insight--legacy-ui' found.")))
+        (if (fboundp 'org-insight--legacy-ui)
+            (org-insight--legacy-ui base)
+          (user-error "Vertico not available and no legacy UI function `org-insight--legacy-ui' found."))
       (let* ((org-insight--current-dir base)
              (minibuffer-allow-text-properties t)
              (table (org-insight--completion-table base))
              (prompt (format "Org Insight (%s): " (abbreviate-file-name base))))
-        (minibuffer-with-setup-hook #'org-insight--minibuffer-setup
-          (let ((selection (completing-read prompt table nil t "")))
-            (when (and selection (not (string-empty-p selection)))
-              (org-insight--visit-candidate selection))))))))
-
+        (setq org-insight--cand-map (make-hash-table :test 'equal))
+        (let ((org-insight--visit-triggered nil)
+              (org-insight--calling-window (selected-window)))
+          (minibuffer-with-setup-hook #'org-insight--minibuffer-setup
+            (let ((selection (completing-read prompt table nil t "")))
+              (unless org-insight--visit-triggered
+                (when (and selection (not (string-empty-p selection)))
+                  (let* ((key (org-insight--unwrap-candidate selection))
+                         (pair (and key (gethash key org-insight--cand-map)))
+                         (file (car-safe pair))
+                         (line (cdr-safe pair))
+                         (target (or org-insight--calling-window
+                                     (and (fboundp 'minibuffer-selected-window)
+                                          (minibuffer-selected-window))
+                                     (selected-window))))
+                    (when (and file line)
+                      ;; Defer this too for the same focus reason.
+                      (run-at-time 0 nil
+                                   #'org-insight--visit-file-line-in-window
+                                   file line target))))))))))))
 (provide 'org-insight)
 ;;; org-insight.el ends here
