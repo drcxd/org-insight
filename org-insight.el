@@ -607,8 +607,20 @@ but *displays* as \"file:line: text\"."
       (concat "  [" (file-name-nondirectory file) "]"))))
 
 (defun org-insight--group (cand transform)
-  "Group function: group by file name (non-directory)."
-  (if transform cand (file-name-nondirectory (or (get-text-property 0 'org-insight-file cand) ""))))
+  "Group candidates by file; use Org #+title if present.
+When TRANSFORM is non-nil, return CAND unchanged (per completion UI contract)."
+  (if transform
+      cand
+    (let ((file (or (get-text-property 0 'org-insight-file cand)
+                    ;; Fallback: unwrap displayed text to look up mapping if needed
+                    (let* ((key (and (stringp cand)
+                                     (if (string-match "\\`.*?⇨ \\(.*\\)\\'" cand)
+                                         (match-string 1 cand)
+                                       cand))))
+                      (when (and (boundp 'org-insight--cand-map)
+                                 (hash-table-p org-insight--cand-map))
+                        (car (gethash key org-insight--cand-map)))))))
+      (org-insight--file-group-name file))))
 
 (defun org-insight--table-with-metadata (table metadata)
   "Wrap completion TABLE so that (ACTION 'metadata) returns METADATA."
@@ -824,6 +836,35 @@ Also restores keyword highlighting."
     ;;                (when-let ((win (get-buffer-window org-insight--preview-buffer-name)))
     ;;                  (when (window-live-p win) (delete-window win)))))
     (exit-minibuffer)))
+
+;; ---------- Org title lookup (fast, no visiting) ----------
+(defvar org-insight--title-cache nil
+  "Per-session cache mapping absolute file paths to display titles for grouping.")
+
+(defun org-insight--org-file-title-fast (file)
+  "Return #+title of FILE if it's an .org file and has a title, else nil.
+Reads only the first ~8KB without visiting the file."
+  (when (and (stringp file)
+             (string-equal (downcase (or (file-name-extension file) "")) "org")
+             (file-readable-p file))
+    (or (and (hash-table-p org-insight--title-cache)
+             (gethash file org-insight--title-cache))
+        (let ((title nil))
+          (with-temp-buffer
+            ;; Read only the head of the file; enough for keywords.
+            (insert-file-contents file nil 0 8192)
+            (goto-char (point-min))
+            (let ((case-fold-search t))
+              (when (re-search-forward "^[ \t]*#\\+title:[ \t]*\\(.*\\)\\s-*$" nil t)
+                (setq title (string-trim (match-string 1))))))
+          (when (and (hash-table-p org-insight--title-cache) title)
+            (puthash file title org-insight--title-cache))
+          title))))
+
+(defun org-insight--file-group-name (file)
+  "Return the display name for grouping: Org #+title or file base name."
+  (or (org-insight--org-file-title-fast file)
+      (file-name-nondirectory (or file ""))))
 
 ;; -----------------------------------------------------------------------------
 ;; Movement (results & file groups)
@@ -1073,14 +1114,18 @@ Does NOT prompt for a directory; reuses `org-insight-default-directory'."
              (minibuffer-allow-text-properties t)
              (table (org-insight--completion-table base))
              (prompt (format "Org Insight (%s): " (abbreviate-file-name base))))
-        (setq org-insight--cand-map (make-hash-table :test 'equal))
+        ;; NEW: per-session caches
+        (setq org-insight--cand-map   (make-hash-table :test 'equal)
+              org-insight--title-cache (make-hash-table :test 'equal))
         (let ((org-insight--visit-triggered nil)
               (org-insight--calling-window (selected-window)))
           (minibuffer-with-setup-hook #'org-insight--minibuffer-setup
             (let ((selection (completing-read prompt table nil t "")))
               (unless org-insight--visit-triggered
                 (when (and selection (not (string-empty-p selection)))
-                  (let* ((key (org-insight--unwrap-candidate selection))
+                  (let* ((key (if (string-match "\\`.*?⇨ \\(.*\\)\\'" selection)
+                                  (match-string 1 selection)
+                                selection))
                          (pair (and key (gethash key org-insight--cand-map)))
                          (file (car-safe pair))
                          (line (cdr-safe pair))
@@ -1089,9 +1134,9 @@ Does NOT prompt for a directory; reuses `org-insight-default-directory'."
                                           (minibuffer-selected-window))
                                      (selected-window))))
                     (when (and file line)
-                      ;; Defer this too for the same focus reason.
                       (run-at-time 0 nil
                                    #'org-insight--visit-file-line-in-window
                                    file line target))))))))))))
+
 (provide 'org-insight)
 ;;; org-insight.el ends here
