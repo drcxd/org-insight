@@ -60,7 +60,7 @@ If nil, you will be prompted for a directory."
                  (const :tag "Built-in (Elisp)" emacs))
   :group 'org-insight)
 
-(defcustom org-insight-ripgrep-extra-args '("--hidden" "--no-heading" "--color=never")
+(defcustom org-insight-ripgrep-extra-args '("--hidden" "--no-heading" "--color=never" "--smart-case")
   "Extra args for ripgrep. `org-insight' always adds --line-number and --with-filename."
   :type '(repeat string) :group 'org-insight)
 
